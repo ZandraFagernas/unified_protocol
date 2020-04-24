@@ -1,0 +1,395 @@
+---
+title: "Supplementary figures"
+output: html_notebook
+author: "Zandra Fagernaes"
+---
+
+This is a walkthrough of all the analyses for the paper "A unified protocol for simultaneous extraction of DNA and proteins from archaeological dental calculus" (Fagernaes 2020) that have figures only in the supplementary section. Individual RUV001 in not included in any statistics, as stated in the paper.
+
+```{r packages, echo = FALSE}
+library(decontam)
+library(readxl)
+library(janitor)
+library(ggpubr)
+library(broom)
+library(tidyverse)
+```
+
+# DNA contaminants
+
+Here we identify likely contaminants using the R package decontam. Input data is a text file exported from MEGAN, containing summarized read counts for genera for each sample. Blanks need to be included. Metadata files needs to contain sample name, library quantification, control status (TRUE/FALSE) and protocol used. The samples need to be in the same order as in the input data file.
+
+## Preparation
+
+```{r}
+# Load data
+raw_species <- read.delim("<PATH_TO_FILE>")
+metadata_dna <- read.delim("<PATH_TO_FILE>") 
+```
+
+The data needs to be fixed a bit before we can use it in decontam.
+
+```{r}
+# Transpose dataframe
+data_dna <- raw_species %>% 
+  gather(SampleID, count, 2:ncol(.)) %>%
+  spread(X.Datasets, count) 
+
+# Remove ending from the sample IDs
+data_dna <- data_dna %>% 
+  mutate(SampleID = gsub(".SG1.1_S0_L001_R1_001.fastq.combined.fq.prefixed.extractunmapped.bam", "", SampleID))
+
+# Convert to matrix
+data_mat_dna <- data.matrix(data_dna[,2:ncol(data_dna)])
+rownames(data_mat_dna) <- data_dna$SampleID
+
+# Order metadata file alphabetically
+metadata_dna <- metadata_dna[order(metadata_dna$SampleID),] 
+```
+
+## Contaminants by prevalence on genus level
+
+This methods uses prevalence of OTUs in blanks to identify contaminants, and is generally recommended for low biomass samples.
+
+```{r}
+# Assign contaminant status
+metadata_dna$is.neg <- metadata_dna$Sample_or_blank=="Blank"
+contam.prev.dna <- isContaminant(data_mat_dna, method="prevalence", neg=metadata_dna$is.neg, threshold = 0.1)
+
+# Check number of contaminants
+table(contam.prev.dna$contaminant)
+
+# List of contaminants
+cont_prev_dna_list <- contam.prev.dna[which(contam.prev.dna$contaminant=="TRUE"), ]
+cont_prev_dna_list
+```
+
+### Identifying best cutoff
+
+```{r}
+ggplot(contam.prev.dna, aes(x=p)) +
+  geom_histogram(bins=100) 
+```
+It looks like the default p=0.1 cutoff is appropriate. 
+
+## Summarize
+
+The list of contaminant taxa was exported and a kingdom assigned for each taxon. Protista was used as a "kingdom" for slime molds and Apicomplexa. Note that a row saying "Total" has been added to the sheet, in order to keep sample totals when filtering for contaminants.
+
+```{r}
+# Load modified contaminant list
+dna_cont_prev_kingdom <- read_csv("<PATH_TO_FILE>") %>%
+  unite("taxa", c(genus, species), sep = " ", remove = TRUE)
+
+# Normalize data by dividing read numbers by total number of assigned reads in sample
+data_norm <- raw_species
+normFunc <- function(x){(x/sum(x))}
+data_norm[2:34] <- apply(data_norm[2:34], 2, normFunc)
+
+# Filter out only contaminant taxa
+contaminants <- data_norm %>% filter(X.Datasets %in% dna_cont_prev_kingdom$taxa)
+
+# Fix sample names and remove blanks
+contaminants <- contaminants %>%
+  setNames(gsub(".SG1.1_S0_L001_R1_001.fastq.combined.fq.prefixed.extractunmapped.bam", "", names(.))) %>%
+  select(-c("EXB037.A0401", "EXB037.A0501", "EXB037.A0601", "EXB037.A0701", "EXB037.A0801", "LIB030.A0101", "LIB030.A0103", "LIB030.A0104", "LIB030.A0105"))
+
+# Transform dataset to long format 
+contaminants <- contaminants %>%
+  gather("SampleID", "norm_value", 2:25) 
+
+# Add kingdom
+colnames(contaminants)[1] <- "taxa"
+contaminant_kingdom <- left_join(contaminants, dna_cont_prev_kingdom) %>%
+  select(-c(freq, prev, p.freq, p.prev, p, contaminant))
+
+# Sum for kingdoms
+contaminant_kingdom_sum <- contaminant_kingdom %>%
+  group_by(SampleID, kingdom) %>% summarize(sum_norm_value = sum(norm_value))
+
+# Add metadata
+contaminant_kingdom_sum_meta <- left_join(contaminant_kingdom_sum, metadata_dna)
+
+# Change proportion data to percentages
+contaminant_kingdom_sum_meta$percent_contaminant <- contaminant_kingdom_sum_meta$sum_norm_value * 100
+
+# Summarize total contaminants
+contaminant_total <- contaminant_kingdom %>%
+  group_by(SampleID) %>% summarize(sum_norm_value = sum(norm_value))
+
+# Add metadata
+contaminant_total_meta <- left_join(contaminant_total, metadata_dna)
+
+# Remove RUV001
+contaminant_total_meta_noruv <- contaminant_total_meta %>%
+  filter(!Individual == "RUV001")
+
+# Make percent contaminants columns
+contaminant_total_meta_noruv$percent_cont <- contaminant_total_meta_noruv$sum_norm_value*100
+
+# Average  and SD of percent contaminants 
+mean(contaminant_total_meta_noruv$percent_cont)
+sd(contaminant_total_meta_noruv$percent_cont)
+
+# Dataset with only RUV001
+contaminant_total_meta_ruv <- contaminant_total_meta %>%
+  filter(Individual == "RUV001")
+
+# Make percent contaminants columns
+contaminant_total_meta_ruv$percent_cont <- contaminant_total_meta_ruv$sum_norm_value*100
+
+# Average  and SD of percent contaminants 
+mean(contaminant_total_meta_ruv$percent_cont)
+sd(contaminant_total_meta_ruv$percent_cont)
+```
+
+### Stats
+
+Significances of changes in normalized proportion of contaminants between the protocols/starting weights are calculated with a pairwise Wilcoxon test, and corrected with the Benjamini-Hochberg method for multiple testing.
+
+```{r}
+# Turn non-summarized data into wide format, remove RUV001
+contaminant_kingdom_sum_meta_wide <- contaminant_kingdom_sum_meta %>%
+  select(-c(sum_norm_value)) %>%
+  spread(kingdom, percent_contaminant, fill=0) %>%
+  filter(!Individual == "RUV001")
+
+# Remove kingdoms only present in RUV001
+ contaminant_kingdom_sum_meta_wide <-  contaminant_kingdom_sum_meta_wide[,                                                  colSums(contaminant_kingdom_sum_meta_wide != 0) > 0]
+
+# Create column for total percentage of contaminant spectra
+contaminant_kingdom_sum_meta_wide$total <- rowSums(contaminant_kingdom_sum_meta_wide[,8:10])
+
+# Normalize contaminant classes by total amount of contamination
+contaminant_kingdom_sum_meta_wide <- contaminant_kingdom_sum_meta_wide %>%
+  mutate_at(8:10, list(~./total))
+
+# Change back into long format
+cont_meta_norm <- contaminant_kingdom_sum_meta_wide %>%
+  gather(kingdom, proportion, 8:10)
+cont_meta_norm$kingdom <- as.factor(cont_meta_norm$kingdom)
+cont_meta_norm$proportion[is.nan(cont_meta_norm$proportion)] <- 0
+
+# Apply statistical test to kingdoms
+
+### NOTE: This is still done one kingdom at a time, I need to ask someone R-proficient how to make it into a loop ###
+
+king <- cont_meta_norm %>%
+  filter(kingdom=="Protista")
+king_test <- tidy(pairwise.wilcox.test(king$proportion, king$Category, p.adjust.method = "BH"))
+
+# Add sample to list of all protein clusters
+king_test$Kingdom <- "Protista"
+cont_results <- rbind(king_test, cont_results)
+
+cont_results <- king_test #Only needs to be done first time 
+
+# Save results
+write.table(cont_results, "<PATH_TO_FILE>")
+
+### NOTE: Further p-value adjustment is necessary, since the abundances are not independent. However, since nothing was significant here, no further adjustment will be done for this dataset.
+```
+
+### Plot
+
+Setup:
+
+```{r}
+# Function for getting same number of decimals in plots
+formatter <- function(...){
+  function(x) format(round(x, 2), ...)
+}
+
+# Dataset without RUV001
+contaminant_kingdom_sum_meta_other <- contaminant_kingdom_sum_meta %>%
+  filter(!Individual == "RUV001")
+
+# Dataset with RUV001
+contaminant_kingdom_sum_meta_ruv <- contaminant_kingdom_sum_meta %>%
+  filter(Individual == "RUV001")
+```
+
+And plot:
+
+```{r}
+other <- ggplot(contaminant_kingdom_sum_meta_other, 
+                aes(x=Category, y=percent_contaminant)) +
+  geom_bar(stat='identity', aes(fill=kingdom), colour="black") +
+  ylab("Contaminants (% of total reads)") +
+  xlab("") +
+  theme_minimal(base_size = 14) +
+  facet_grid(~Individual) +
+  scale_y_continuous(labels = formatter(nsmall = 1)) +
+  scale_x_discrete(limits=c("DO10", "UP10", "DO2", "UP2")) +
+  theme(axis.text.x = element_text(angle = 90, hjust=0.95,vjust=0.2)) + 
+  scale_fill_manual(values=c("#332288", "#44AA99", "#661100", "#999933", "#AA4499", "#888888", "#6699CC"),
+              name="Kingdom/group",
+              labels=c("Animalia", "Bacteria", "Fungi", "Plantae", "Protista", "Synthetic", "Virus")) 
+
+ruv <- ggplot(contaminant_kingdom_sum_meta_ruv, 
+                aes(x=Category, y=percent_contaminant)) +
+  geom_bar(stat='identity', aes(fill=kingdom), colour="black") +
+  ylab("") +
+  xlab("") +
+  theme_minimal(base_size = 14) +
+  facet_grid(~Individual) +
+  scale_y_continuous(labels = formatter(nsmall = 1), position = "right") +
+  scale_x_discrete(limits=c("DO10", "UP10", "DO2", "UP2")) +
+  theme(axis.text.x = element_text(angle = 90, hjust=0.95,vjust=0.2)) + 
+  scale_fill_manual(values=c("#332288", "#44AA99", "#661100", "#999933", "#AA4499", "#888888", "#6699CC"),
+              name="Kingdom/group",
+              labels=c("Animalia", "Bacteria", "Fungi", "Plantae", "Protista", "Synthetic", "Virus")) 
+
+cont_plot <- ggarrange(other, ruv,
+                       ncol=2, nrow=1, 
+                       widths = c(3.5, 1),
+                       common.legend = TRUE, 
+                       legend = "right")
+```
+
+
+# Protein contaminants
+
+This part extracts and quantifies contaminants in a metaproteomics dataset. Input is a protein cluster report from Scaffold. All keratins, collagens and serum albumins will be considered contaminants in this script, no matter which species they are assigned to. See explanation in paper.
+
+## Data import and preparation
+
+```{r eval=FALSE}
+# Import raw data
+data <- read.delim("<PATH_TO_FILE>") %>%
+  janitor::clean_names() %>%
+  separate("ms_ms_sample_name", c("SampleID", "Remove"), sep="_") %>%
+  select(-c("Remove"))
+
+# Import metadata file 
+metadata <- read.delim("<PATH_TO_FILE>")
+```
+
+## Contaminants
+
+This part will extract all contaminants.
+
+```{r}
+# Select only collagens and keratins, remove any reverse hits among them
+contaminants <- data %>%
+  filter(str_detect(protein_cluster, "Collagen|Keratin|Serum albumin")) %>%
+  filter(!str_detect(protein_accession_numbers, 'rr//|REV'))
+
+# Remove percentage sign from the "Percentage of total spectra" column
+contaminants$percentage_of_total_spectra <- as.numeric(gsub("%", "", contaminants$percentage_of_total_spectra))
+```
+
+Then we need to clean up the data a bit and add metadata.
+
+```{r warning=FALSE}
+# Select only necessary columns
+data_plot <- contaminants %>%
+  select(SampleID, protein_cluster, percentage_of_total_spectra)
+
+# Create column classifying proteins into keratin or collagen
+data_plot$class <- data_plot$protein_cluster
+data_plot <- data_plot %>%
+  separate("class", c("r1", "r2", "protein_class")) %>%
+  select(-c("r1", "r2"))
+
+# Summarize
+perc_cont <- data_plot %>%
+  group_by(SampleID, protein_class) %>%
+  summarize(sum_percent_cont=sum(percentage_of_total_spectra))
+
+# Add metadata 
+perc_cont_meta <- left_join(metadata, perc_cont) 
+```
+
+## Stats
+
+Significances of changes in amount contamination between the protocols/starting weights are calculated with a pairwise Wilcoxon test, and corrected with the Benjamini-Hochberg method for multiple testing.
+
+```{r}
+# Replace NA with zero
+perc_cont_meta <- perc_cont_meta %>%
+  mutate_if(is.numeric, ~replace(., is.na(.), 0))
+
+# Summarize all contaminants
+cont_summary <- perc_cont_meta %>%
+  group_by(SampleID, Category, Weight, Protocol, Individual) %>%
+  summarize(total_cont=sum(sum_percent_cont))
+
+# Total contaminants, without RUV001
+cont_summary_noruv <- cont_summary %>%
+  filter(!Individual=="RUV001")
+cont_signif_test_noruv <- pairwise.wilcox.test(cont_summary_noruv$total_cont, cont_summary_noruv$Category, p.adjust.method = "BH")
+cont_signif_test_noruv # Nothing significant
+
+# Turn non-summarized data into wide format and remove RUV001
+perc_cont_meta_wide <- perc_cont_meta %>%
+  filter(!Individual == "RUV001") %>%
+  spread(protein_class, sum_percent_cont, fill=0)
+
+# Create column for total percentage of contaminant spectra
+perc_cont_meta_wide$total <- rowSums(perc_cont_meta_wide[,6:8])
+
+# Normalize contaminant classes by total amount of contamination
+perc_cont_meta_wide <- perc_cont_meta_wide %>%
+  mutate_at(6:8, list(~./total))
+
+# Change back into long format
+cont_meta_norm <- perc_cont_meta_wide %>%
+  gather(protein_class, proportion, 6:8)
+cont_meta_norm$protein_class <- as.factor(cont_meta_norm$protein_class)
+
+### NOTE: This is still done one amino acid type at a time, I need to ask someone R-proficient how to make it into a loop ###
+
+# Apply statistical test to each contaminant
+cont <- cont_meta_norm %>%
+  filter(protein_class=="Serum")
+cont_test <- tidy(pairwise.wilcox.test(cont$proportion, cont$Category, p.adjust.method = "BH"))
+
+# Add sample to list of all amino acid compositions
+cont_test$protein_class <- "Serum"
+cont_results <- rbind(cont_test, cont_results)
+
+cont_results <- cont_test #Only needs to be done first time 
+
+# Save results
+write.table(cont_results, "<PATH_TO_FILE>")
+
+### NOTE: You will need to adjust for each protein comparison too, since they are not independent (i.e. 3 dependent tests). ###
+
+# Extract significant results
+sign_cont <- cont_results %>%
+  filter(p.value < 0.05)
+
+# BH correction for 20 dependent proteins 
+p.adjust(sign_cont$p.value, method = "BH", n = 3) 
+```
+
+## Plotting setup
+
+```{r}
+# Function for getting same number of decimals in plots
+formatter <- function(...){
+  function(x) format(round(x, 1), ...)
+}
+  
+# Set order of categories 
+perc_cont_meta$Category <- factor(perc_cont_meta$Category, levels=c("PO10", "UP10", "PO2", "UP2"))
+
+# Set order of individuals
+perc_cont_meta$Individual <- factor(perc_cont_meta$Individual, levels=c("DRT001", "SMD017", "SMD046", "SMD051", "WIG001", "RUV001"))
+```
+
+## Plot!
+
+```{r}
+cont <- ggplot(perc_cont_meta, aes(x=Category, y=sum_percent_cont, fill=protein_class)) +
+  geom_bar(stat="identity", colour="black") +
+  ylab("Contaminants (% of total spectra)") +
+  facet_wrap(~Individual, scales="free_y") +
+  scale_y_continuous(labels = formatter(nsmall = 1)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0)) +
+  scale_fill_manual(values=c("#44AA99", "#AA4499", "#332288"),
+              name="Protein",
+              labels=c("Collagen", "Keratin", "Serum albumin"))
+```

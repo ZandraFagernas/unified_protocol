@@ -1,0 +1,290 @@
+---
+title: "Protein yield analysis"
+output: html_notebook
+author: "Zandra Fagernaes"
+---
+
+This notebook goes through the analyses of protein yield in the paper "A unified protocol for simultaneous extraction of DNA and proteins from archaeological dental calculus" (Fagernaes et al. 2020). The data is summarized in figure 6.
+
+The statistics part is created by AB Rohrlach and modified by Zandra Fagernaes, the rest is written by Zandra Fagernas. Note that individual RUV001 is excluded from all statistics, as mentioned in the paper. 
+
+```{r}
+require(cowplot)
+require(tidyverse)
+require(glmmTMB)
+require(magrittr)
+require(readxl)
+require(janitor)
+require(lme4)
+require(merTools)
+library(ggpubr)
+library(lmerTest)
+```
+
+## Load data
+
+```{r}
+protyield <- read_excel("<PATH_TO_FILE>") %>% 
+  janitor::clean_names() %>% # sanitise column names for R
+  na.omit() %>% # remove an NA rows
+  dplyr::group_by(individual) %>% # For each individual...
+  dplyr::filter(individual!='RUV001') %>% 
+  dplyr::mutate(yield.norm=abs(yield_ng_mg/max(yield_ng_mg)-1e-6)) %>% # Normalise by maximum yield (and shift into unit interval for regression)
+  dplyr::ungroup() %>% # Make dataframe whole again
+  dplyr::mutate(protocol=factor(protocol,levels=c('UP','PO')))
+```
+
+## Statistics
+
+Let's first take a quick look at the data.
+
+```{r}
+# Initial look at the data
+ggplot(protyield,aes(x=individual,y=yield_ng_mg))+
+  stat_boxplot(geom='errorbar')+
+  geom_boxplot()+
+  theme_bw()+
+  geom_point(aes(col=weight_category,pch=protocol))
+
+# Boxplot of Protocol vs yield (on the unit scale). They do not appear different.
+protyield %>%
+  dplyr::group_by(individual) %>%
+  dplyr::mutate(yield_ng_mg=yield_ng_mg/max(yield_ng_mg)) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x=protocol,y=yield_ng_mg))+
+  theme_bw()+
+  stat_boxplot(geom='errorbar')+
+  geom_boxplot()+
+  geom_point(aes(pch=protocol,col=weight_category))
+
+# Boxplot of Weight category and yield - They appear significantly different!
+protyield %>%
+  dplyr::group_by(individual) %>%
+  dplyr::mutate(yield_ng_mg=yield_ng_mg/max(yield_ng_mg)) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x=weight_category,y=yield_ng_mg))+
+  theme_bw()+
+  stat_boxplot(geom='errorbar')+
+  geom_boxplot()+
+  geom_point(aes(pch=protocol,col=weight_category))
+
+protyield %>%
+  dplyr::group_by(individual) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x=individual,y=yield_ng_mg))+
+  theme_bw()+
+  stat_boxplot(geom='errorbar')+
+  geom_boxplot()+
+  geom_point(aes(pch=protocol,col=weight_category))
+```
+
+Begin by using a standard linear model of the form yield ~ protocol and for a full interaction model of protocol and weight_cat (no random effects for either), to find an optimal box-cox transformation.
+
+```{r}
+MASS::boxcox(lm(yield.norm~protocol,data=protyield))
+MASS::boxcox(lm(yield.norm~protocol:weight_category,data=protyield))
+```
+
+Note that the above plots contain the value zero between the dotted lines. This means a log-transformation is reasonable. I can hence use a log-transformed structure for model testing (i.e. dropping the weight_cat variable) too!
+
+Now I use the lmer package to fit mixed-effects models, where the random effect is the individual. That is, I wish to capture the variability caused by the fact that each individual is different, but in the long run, I want to even this out (for a better understanding, please see literature on mixed-effects models, or come chat to me). I couldn't also fit a random slope as there wasn't enough data, and the REML estimates were singular.
+
+I need to check to see if we need to include weight_cat in the model - I'll test models using anova. Each anova has two inputs, which are both models. One must be a slightly simpler model than the other, i.e. nested models.
+
+Basically the null hypothesis for each anova test is "these models explain the data (residuals) equally well". Clearly, if we retain that null hypothesis, then we should use the simpler model! If we reject the hypothesis, then we cannot choose the simpler model, as we have lost significant predicitve power.
+
+```{r}
+# Compare full interaction model with an additive model
+protyieldInteraction.lmer <- lmerTest::lmer(log(yield_ng_mg)~protocol:weight_category+(1|individual),data=protyield)
+protyieldAdditive.lmer <- lmer(log(yield_ng_mg)~protocol+weight_category+(1|individual),data=protyield)
+anova(protyieldInteraction.lmer, protyieldAdditive.lmer) # p < 0.05, can't simplify model
+summary(protyieldInteraction.lmer)
+
+# Let's look at the output from our model.
+summary(protyieldInteraction.lmer)
+protyield$prediction <- exp(predict(protyieldInteraction.lmer)) 
+```
+
+Here I'm just doing some sanity checking. 
+
+```{r}
+exp(predictInterval(protyieldInteraction.lmer,protyield, include.resid.var=0, 
+                    ignore.fixed.terms = 1)) %>%
+  as_tibble() %>%
+  dplyr::mutate(individual=protyield$individual,yield_ng_mg=protyield$yield_ng_mg,
+                protocol=protyield$protocol) %>%
+  ggplot(aes(x=individual,y=fit,col=protocol,pch=protocol))+
+  theme_bw()+
+  geom_point(data=protyield,aes(y=yield_ng_mg),col='black') + 
+  geom_errorbar(aes(ymax=upr,ymin=lwr),alpha=0.1)+
+  geom_point()
+```
+
+
+```{r}
+# We should probably check some residual diagnostics to make certain our model fits okay.
+protyield.tib <- protyield %>%
+  add_column(fitted.lmer=fitted(protyieldInteraction.lmer)) %>%
+  add_column(res.lmer=residuals(protyieldInteraction.lmer)) 
+
+# Here I make the plots....
+fit.v.res.lmer <- ggplot(protyield.tib,aes(x=fitted.lmer,y=residuals(protyieldInteraction.lmer))) +
+  theme_bw()+
+  geom_point(pch=1)+
+  geom_hline(yintercept=0,col='red',linetype='dashed')+
+  xlab('Fitted')+
+  ylab('Residuals')
+qqplot.lmer <- ggplot(protyield,aes(sample=residuals(protyieldInteraction.lmer)))+
+  theme_bw()+
+  stat_qq(pch=1)+
+  stat_qq_line(col='red',linetype='dashed')+
+  ylab('Sample Quantiles')+
+  xlab('Theoretical Quantiles')
+
+# Here I collate the plots
+plot_grid(fit.v.res.lmer,qqplot.lmer,nrow=1,labels=c("A","B"))
+```
+
+## Calculate changes
+
+First we need to summarize the data, by calculating means over the different replicates. 
+
+```{r}
+# Summary per individual and category
+individual_summary <- protyield %>%
+  group_by(individual, category) %>%
+  summarize(mean_yield=mean(yield_ng_mg))
+individual_summary_wide <- individual_summary %>%
+  spread(category, mean_yield)
+
+# Summary per category
+category_summary <- protyield %>%
+  group_by(category) %>%
+  summarize(mean_yield=mean(yield_ng_mg))
+```
+
+And now we can calculate fold change and percentage change per weight category.
+
+```{r}
+# Fold change per individual, within protocols
+individual_summary_wide$UP2toUP10 <- individual_summary_wide$UP2mg/individual_summary_wide$UP10mg
+individual_summary_wide$PO2toPO10 <- individual_summary_wide$PO2mg/individual_summary_wide$PO10mg
+individual_summary_wide$PO2toUP2 <- individual_summary_wide$PO2mg/individual_summary_wide$UP2mg
+individual_summary_wide$UP10toPO10 <- individual_summary_wide$UP10mg/individual_summary_wide$PO10mg
+
+# Mean and SD fold change UP
+mean(individual_summary_wide$UP2toUP10)
+sd(individual_summary_wide$UP2toUP10)
+
+# Mean and SD fold change PO
+mean(individual_summary_wide$PO2toPO10)
+sd(individual_summary_wide$PO2toPO10)
+
+# Mean and SD fold change 2mg
+mean(individual_summary_wide$PO2toUP2)
+sd(individual_summary_wide$PO2toUP2)
+
+# Mean and SD fold change 10mg - note UP is more!
+mean(individual_summary_wide$UP10toPO10)
+sd(individual_summary_wide$UP10toPO10)
+
+# Percentage change per individual, for weight categories, for discussion
+individual_summary_wide$perc2mg <-
+  ((individual_summary_wide$UP2mg-individual_summary_wide$PO2mg)/individual_summary_wide$PO2mg)*100
+individual_summary_wide$perc10mg <-
+  ((individual_summary_wide$UP10mg-individual_summary_wide$PO10mg)/individual_summary_wide$PO10mg)*100
+
+# Mean and SD percentage 2mg
+mean(individual_summary_wide$perc2mg)
+sd(individual_summary_wide$perc2mg)
+
+# Mean and SD change 10mg - note UP is more!
+mean(individual_summary_wide$perc10mg)
+sd(individual_summary_wide$perc10mg)
+```
+
+And let's also see what is going on with RUV001.
+
+```{r}
+# Load data
+protyieldruv <- read_xlsx(path='<PATH_TO_FILE>',na='NA') %>% 
+  janitor::clean_names() %>% # sanitise column names for R
+  na.omit() %>% # remove an NA rows
+  dplyr::filter(individual=='RUV001') %>% 
+  dplyr::mutate(protocol=factor(protocol,levels=c('UP','PO')))
+
+# Summarize
+ruv_summary <- protyieldruv %>%
+  group_by(category) %>%
+  summarize(mean_yield=mean(yield_ng_mg))
+ruv_summary_wide <- ruv_summary %>%
+  spread(category, mean_yield)
+```
+
+
+## Plotting
+
+Import and prepare data and aesthetics:
+
+```{r}
+# Import data
+protyield_all <- read_xlsx(path='<PATH_TO_FILE>',na='NA') %>%
+  janitor::clean_names() %>% 
+  na.omit() 
+
+# Split data into 2mg and 10mg datasets
+prot10 <- protyield_all %>%
+  filter(weight_category=="Ten")
+prot2 <- protyield_all %>%
+  filter(weight_category=="Two")
+
+# Specify colours for protocols
+my_colours = c("#332288", "#AA4499")
+names(my_colours) = c("PO", "UP")
+
+# Re-order individuals from oldest to youngest
+prot10$individual<- factor(prot10$individual, 
+                           levels=c("DRT001", "SMD017", "SMD046", "SMD051", "WIG001", "RUV001"))
+prot2$individual <- factor(prot2$individual, 
+                           levels=c("DRT001", "SMD017", "SMD046", "SMD051", "WIG001", "RUV001"))
+```
+
+Create plots:
+
+```{r}
+prot2plot <- ggplot(prot2, aes(x=protocol,y=yield_ng_mg))+
+  facet_grid(~individual) +
+  geom_rect(data = subset(prot2,individual == c("DRT001", "SMD046", "WIG001")),
+            fill = "grey", xmin = -Inf,xmax = Inf,
+            ymin = -Inf,ymax = Inf,alpha = 0.3) +
+  geom_point(aes(colour=protocol, shape=protocol), size=5) +
+  ylim(0, 800) +
+  xlab("Protocol") +
+  ylab("Yield (ng/mg)") +
+  ggtitle("Starting weight 2 mg") +
+  scale_color_manual(values=my_colours) +
+  scale_shape_manual(values=c(16, 17)) +
+  labs(colour = "Protocol", shape = "Protocol") +
+  theme_minimal()
+
+prot10plot <- ggplot(prot10, aes(x=protocol,y=yield_ng_mg)) +
+  facet_grid(~individual) +
+  geom_rect(data = subset(prot10,individual == c("DRT001", "SMD046", "WIG001")),
+            fill = "grey", xmin = -Inf,xmax = Inf,
+            ymin = -Inf,ymax = Inf,alpha = 0.3) +
+  geom_point(aes(colour=protocol, shape=protocol), size=5) +
+  ylim(0, 800) +
+  xlab("Protocol") +
+  ylab("Yield (ng/mg)") +
+  ggtitle("Starting weight 10 mg") +
+  scale_color_manual(values=my_colours) +
+  scale_shape_manual(values=c(16, 17)) +
+  labs(colour = "Protocol", shape = "Protocol") +
+  theme_minimal()
+
+protyield_fig <- ggarrange(prot2plot, prot10plot,
+                           ncol=2, nrow=1, 
+                           labels = c("(A)", "(B)"),
+                           common.legend = TRUE, 
+                           legend = "right")
+```

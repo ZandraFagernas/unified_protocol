@@ -1,0 +1,293 @@
+---
+title: "DNA yield analysis"
+output: html_notebook
+author: "Zandra Fagernaes"
+---
+
+This is a walkthrough of all the DNA recovery analysis for the paper "A unified protocol for simultaneous extraction of DNA and proteins from archaeological dental calculus" (Fagernaes et al. 2020). The data is summarized in figure 2. 
+
+The statistics part is created by AB Rohrlach and modified by Zandra Fagernaes, the rest is written by Zandra Fagernas. Note that individual RUV001 is excluded from all statistics, as mentioned in the paper. 
+
+```{r}
+require(cowplot)
+require(glmmTMB)
+require(magrittr)
+require(lme4)
+require(merTools)
+library(ggpubr)
+library(readxl)
+library(janitor)
+library(tidyverse)
+```
+
+## Load data
+
+```{r}
+# Load data for all individuals except RUV001
+dnayield <- read_xlsx(path='<PATH_TO_FILE>',na='NA') %>% 
+  janitor::clean_names() %>% # sanitise column names for R
+  na.omit() %>% # remove an NA rows
+  dplyr::filter(individual!='RUV001') %>% 
+  dplyr::group_by(individual) %>% 
+  dplyr::mutate(yield.norm=abs(yield_ng_mg/max(yield_ng_mg)-1e-6)) %>% # Normalise by maximum yield (and shift into unit interval for regression)
+  dplyr::ungroup() %>% # Make dataframe whole again
+  dplyr::mutate(protocol=factor(protocol,levels=c('UP','DO')))
+
+# # Load data for only RUV001
+dnayieldruv <- read_xlsx(path='<PATH_TO_FILE>',na='NA') %>% 
+  janitor::clean_names() %>% # sanitise column names for R
+  na.omit() %>% # remove an NA rows
+  dplyr::filter(individual=='RUV001') %>% 
+  dplyr::mutate(protocol=factor(protocol,levels=c('UP','DO')))
+```
+
+
+## Statistics
+
+Let's first take a quick look at the data.
+
+```{r}
+# Initial look at the data
+ggplot(dnayield,aes(x=individual,y=yield_ng_mg))+
+  stat_boxplot(geom='errorbar')+
+  geom_boxplot()+
+  theme_bw()+
+  geom_point(aes(col=weight_category,pch=protocol))
+
+# Boxplot of Protocol vs yield (on the unit scale). Note they appear different!
+dnayield %>%
+  dplyr::group_by(individual) %>%
+  dplyr::mutate(yield=yield_ng_mg/max(yield_ng_mg)) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x=protocol,y=yield_ng_mg))+
+  theme_bw()+
+  stat_boxplot(geom='errorbar')+
+  geom_boxplot()+
+  geom_point(aes(pch=protocol,col=weight_category))
+
+# Boxplot of Weight category and yield - They do not appear significantly different!
+dnayield %>%
+  dplyr::group_by(individual) %>%
+  dplyr::mutate(yield=yield_ng_mg/max(yield_ng_mg)) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x=weight_category,y=yield_ng_mg))+
+  theme_bw()+
+  stat_boxplot(geom='errorbar')+
+  geom_boxplot()+
+  geom_point(aes(pch=protocol,col=weight_category))
+
+dnayield %>%
+  dplyr::group_by(individual) %>%
+  dplyr::ungroup() %>%
+  ggplot(aes(x=individual,y=yield_ng_mg))+
+  theme_bw()+
+  stat_boxplot(geom='errorbar')+
+  geom_boxplot()+
+  geom_point(aes(pch=protocol,col=weight_category))
+```
+
+Begin by using a standard linear model of the form yield ~ protocol and for a full interaction model of protocol and weight_cat (no random effects for either), to find an optimal box-cox transformation.
+
+```{r}
+MASS::boxcox(lm(yield.norm~protocol,data=dnayield))
+MASS::boxcox(lm(yield.norm~protocol:weight_category,data=dnayield))
+```
+
+Note that the above plots contain the value zero between the dotted lines. This means a log-transformation is reasonable. I can hence use a log-transformed structure for model testing (i.e. dropping the weight_cat variable) too!
+
+Now I use the lmer package to fit mixed-effects models, where the random effect is the individual. That is, I wish to capture the variability caused by the fact that each individual is different, but in the long run, I want to even this out (for a better understanding, please see literature on mixed-effects models, or come chat to me). I couldn't also fit a random slope as there wasn't enough data, and the REML estimates were singular.
+
+I need to check to see if we need to include weight_cat in the model - I'll test models using anova. Each anova has two inputs, which are both models. One must be a slightly simpler model than the other, i.e. nested models.
+
+Basically the null hypothesis for each anova test is "these models explain the data (residuals) equally well". Clearly, if we retain that null hypothesis, then we should use the simpler model! If we reject the hypothesis, then we cannot choose the simpler model, as we have lost significant predicitve power.
+
+```{r}
+# Compare full interaction model with an additive model 
+dnayieldInteraction.lmer <-
+  lmer(log(yield_ng_mg)~protocol:weight_category+(1|individual),data=dnayield)
+dnayieldAdditive.lmer <-
+  lmer(log(yield_ng_mg)~protocol+weight_category+(1|individual),data=dnayield)
+anova(dnayieldInteraction.lmer,dnayieldAdditive.lmer) # p>0.05, retain and use simpler model!
+summary(dnayieldAdditive.lmer) # Note that the t-value for weight_category is small. We'll try dropping that predictor.
+
+# Compare additive model to model without weight_cat
+dnayield.lmer <- lmer(log(yield_ng_mg)~protocol+(1|individual),data=dnayield)
+anova(dnayieldAdditive.lmer,dnayield.lmer) # p > 0.05, retain and use simpler model!
+ 
+# Okay, the only model simpler than with just protocol has no predictors (a null model). Let's compare these.
+dnayieldNull.lmer <- lmer(log(yield_ng_mg)~1+(1|individual),data=dnayield)
+anova(dnayield.lmer,dnayieldNull.lmer) # p < 0.05, hence reject the null hypothesis and we cannot simplify this model further! 
+
+# Let's look at the output from our model.
+summary(dnayield.lmer)
+dnayield$prediction <- exp(predict(dnayield.lmer))
+```
+
+Here I'm just doing some sanity checking. For each individual I'll predict their mean
+yield, given the two protocols separately. It all looks pretty good, except WIG001 is
+a little downward biased, but since they're an extremem case, that's okay.
+
+```{r}
+exp(predictInterval(dnayield.lmer,dnayield, include.resid.var=0, 
+                    ignore.fixed.terms = 1)) %>%
+  as_tibble() %>%
+  dplyr::mutate(individual=dnayield$individual,yield_ng_mg=dnayield$yield_ng_mg,
+                protocol=dnayield$protocol) %>%
+ggplot(aes(x=individual,y=fit,col=protocol,pch=protocol))+
+  theme_bw()+
+  geom_point(data=dnayield,aes(y=yield_ng_mg),col='black') + 
+  geom_errorbar(aes(ymax=upr,ymin=lwr),alpha=0.1)+
+  geom_point()
+```
+
+Okay, the model is of the form log(y) = B0 + B1*x, where x = 1 if UP, and 0 if DO. When back transformed, this yields y = exp(B0)*exp(B1)^x. Hence when: x = 0 (DO), y = exp(B0), and when x = 1 , UP, y = exp(B0)exp(B1). Hence, we can interpret exp(B1) as the multiplicative increase in yield when using UP. Since our slope B1 was negative, 0 < exp(B1) < 1. Hence UP decrease the expected yield.
+
+```{r}
+protocol.ci <- confint(dnayield.lmer)[4,]
+c(exp(protocol.ci)[1],exp(coef(summary(dnayield.lmer))[2,1]),exp(protocol.ci)[2])*100-100
+```
+
+From the above line we can see the expected change in yield, and the confidence interval.
+
+```{r}
+# We should probably check some residual diagnostics to make certain our model fits okay.
+dnayield.tib <- dnayield %>%
+  add_column(fitted.lmer=fitted(dnayield.lmer)) %>%
+  add_column(res.lmer=residuals(dnayield.lmer)) 
+
+# Here I make the plots....
+fit.v.res.lmer <- ggplot(dnayield.tib,aes(x=fitted.lmer,y=residuals(dnayield.lmer))) +
+  theme_bw()+
+  geom_point(pch=1)+
+  geom_hline(yintercept=0,col='red',linetype='dashed')+
+  xlab('Fitted')+
+  ylab('Residuals')
+qqplot.lmer <- ggplot(dnayield,aes(sample=residuals(dnayield.lmer)))+
+  theme_bw()+
+  stat_qq(pch=1)+
+  stat_qq_line(col='red',linetype='dashed')+
+  ylab('Sample Quantiles')+
+  xlab('Theoretical Quantiles')
+
+# Here I collate the plots
+plot_grid(fit.v.res.lmer,qqplot.lmer,nrow=1,labels=c("A","B"))
+```
+
+A: The residual plot looks pretty good. Again, the points at the far right end look a little upward skewed, but with only five individuals, one of which had significantly higher yield, I'm not shocked. The good news is that it looks like random scatter about the zero-line.
+
+B: The qq-plot is okay, but not great. The points fall from the red line a little for low negative values here. Again, WIG001 has affected us again here. However, since we're not doing a lot of predictions, I think we'll be okay, and that our lower estimate for yield might be conservative. All in all, I'm pretty happy with these plots.
+
+
+## Calculate changes
+
+First we need to summarize the data, by calculating means over the different replicates. T
+
+```{r}
+# Summary per individual and category
+individual_summary <- dnayield %>%
+  group_by(individual, category) %>%
+  summarize(mean_yield=mean(yield_ng_mg))
+individual_summary_wide <- individual_summary %>%
+  spread(category, mean_yield)
+
+# Summary per category
+category_summary <- dnayield %>%
+  group_by(category) %>%
+  summarize(mean_yield=mean(yield_ng_mg))
+```
+
+And now we can calculate fold change and percentage change per weight category.
+
+```{r}
+# Fold change per individual between protocols, within weigth categories
+individual_summary_wide$DO2toUP2 <- individual_summary_wide$DO2/individual_summary_wide$UP2
+individual_summary_wide$DO10toUP10 <- individual_summary_wide$DO10/individual_summary_wide$UP10
+
+# Mean and SD fold change 2mg
+mean(individual_summary_wide$DO2toUP2)
+sd(individual_summary_wide$DO2toUP2)
+
+# Mean and SD fold change 10mg 
+mean(individual_summary_wide$DO10toUP10)
+sd(individual_summary_wide$DO10toUP10)
+```
+
+And let's also see what is going on with RUV001.
+
+```{r}
+# Summarize
+ruv_summary <- dnayieldruv %>%
+  group_by(category) %>%
+  summarize(mean_yield=mean(yield_ng_mg))
+ruv_summary_wide <- ruv_summary %>%
+  spread(category, mean_yield)
+```
+
+
+## Plotting
+
+Import and prepare data and aesthetics:
+
+```{r}
+# Import data
+dnayield_all <- read_xlsx(path='<PATH_TO_FILE>',na='NA') %>%
+  janitor::clean_names() %>%
+  na.omit() # remove an NA rows
+
+# Split data into 2mg and 10mg datasets
+dna10 <- dnayield_all %>%
+  filter(weight_category=="Ten")
+dna2 <- dnayield_all %>%
+  filter(weight_category=="Two")
+
+# Specify colours for protocols
+my_colours = c("#332288", "#AA4499")
+names(my_colours) = c("DO", "UP")
+
+# Re-order individuals from oldest to youngest
+dna10$individual <- factor(dna10$individual, 
+                           levels=c("DRT001", "SMD017", "SMD046", "SMD051", "WIG001", "RUV001"))
+dna2$individual <- factor(dna2$individual, 
+                           levels=c("DRT001", "SMD017", "SMD046", "SMD051", "WIG001", "RUV001"))
+```
+
+Create plots:
+
+```{r}
+dna2plot <- ggplot(dna2, aes(x=protocol,y=yield_ng_mg))+
+  facet_grid(~individual) +
+  geom_rect(data = subset(dna2,individual == c("DRT001", "SMD046", "WIG001")),
+            fill = "grey", xmin = -Inf,xmax = Inf,
+            ymin = -Inf,ymax = Inf,alpha = 0.3) +
+  geom_point(aes(colour=protocol, shape=protocol), size=5) +
+  ylim(0, 200) +
+  xlab("Protocol") +
+  ylab("Yield (ng/mg)") +
+  ggtitle("Starting weight 2 mg") +
+  scale_color_manual(values=my_colours) +
+  scale_shape_manual(values=c(16, 17)) +
+  labs(colour = "Protocol", shape = "Protocol") +
+  theme_minimal()
+
+dna10plot <- ggplot(dna10, aes(x=protocol,y=yield_ng_mg)) +
+  facet_grid(~individual) +
+  geom_rect(data = subset(dna2,individual == c("DRT001", "SMD046", "WIG001")),
+            fill = "grey", xmin = -Inf,xmax = Inf,
+            ymin = -Inf,ymax = Inf,alpha = 0.3) +
+  geom_point(aes(colour=protocol, shape=protocol), size=5) +
+  ylim(0, 200) +
+  xlab("Protocol") +
+  ylab("Yield (ng/mg)") +
+  ggtitle("Starting weight 10 mg") +
+  scale_color_manual(values=my_colours) +
+  scale_shape_manual(values=c(16, 17)) +
+  labs(colour = "Protocol", shape = "Protocol") +
+  theme_minimal()
+
+dnayield_fig <- ggarrange(dna2plot, dna10plot,
+                           ncol=2, nrow=1, 
+                           labels = c("(A)", "(B)"),
+                           common.legend = TRUE, 
+                           legend = "right")
+```
+

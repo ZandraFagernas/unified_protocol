@@ -1,0 +1,624 @@
+---
+title: "Microbiome analyses"
+output: html_notebook
+author: "Zandra Fagernaes"
+---
+
+This is a walkthrough of all the microbiome analyses for the paper "A unified protocol for simultaneous extraction of DNA and proteins from archaeological dental calculus" (Fagernaes et al. 2020). The data is summarized in figure 4. Individual RUV001 in not included in any statistics, as stated in the paper.
+
+```{r}
+library(janitor)
+library(readxl)
+library(ggpubr)
+library(zCompositions)
+library(vegan)
+library(cowplot)
+library(tidyverse)
+```
+
+# Species number
+
+This part of the script explores the number of species found in each sample and which phylum they belong to.
+
+## Import data
+
+Raw data is output from the MALT run (see details in paper) exported through MEGAN, with summarized count on species level and taxonpath. Contaminants were identified from the same file using decontam with the prevalence method. 
+
+```{r}
+raw_data <- read.delim("<PATH_TO_FILE>")
+
+metadata <- read.delim("<PATH_TO_FILE>") %>% 
+  mutate(SampleID = gsub(".SG1.1", "", SampleID))
+
+contaminants <- read.csv("<PATH_TO_FILE>", sep="")
+```
+
+## Prepare data
+
+```{r}
+# Remove contaminants
+data_calculus <- anti_join(raw_data, contaminants, by=c("X.Datasets" = "species"))
+
+# Fix sample names
+colnames(data_calculus) <- gsub(".SG1.1_S0_L001_R1_001.fastq.combined.fq.prefixed.extractunmapped.bam", "", colnames(data_calculus))
+
+# Remove blanks
+data_calculus <- data_calculus %>%
+  dplyr::select(-c(EXB037.A0401, EXB037.A0501, EXB037.A0601, EXB037.A0701, EXB037.A0801,
+            LIB030.A0101, LIB030.A0103, LIB030.A0104, LIB030.A0105))
+
+# Remove species that were only present in blanks
+data_calculus <- data_calculus[rowSums(data_calculus[2:25]) !=0, ]
+```
+
+Next, we want to create a taxonomy table for all our filtered species. This part is created by James Fellows Yates.
+
+```{r}
+taxonomy_to_tibble <- function(x) {
+ y <- gsub("\\[", "", x)
+ y <- gsub("\\]", "", y)
+ y <- gsub("\\(.*\\)", "", y)
+ 
+ ttt_uid <- taxize::get_uid(y, db = "ncbi") ## inspired by myTAI::taxonomy()
+ ttt_result <- taxize::classification(ttt_uid)[[1]] ## inspired by myTAI::taxonomy()
+ 
+ if ( is.na(ttt_result)[1] ) {
+  ttt_out <- x  
+ } else {
+  ttt_out <- as_tibble(ttt_result %>% 
+   mutate(taxon = paste(x)) %>%
+   filter(rank %in% c("superkingdom", "kingdom", "phylum", "class", "order", "family", "genus", "species")) %>%
+   dplyr::select(name, rank, taxon) %>%
+   spread(rank, name))
+ }
+ return(ttt_out)
+  Sys.sleep(2)
+}
+
+taxonomy_summary <- tibble(taxon = character(), 
+              superkingdom = character(),
+              kingdom = character(),
+              phylum = character(),
+              class = character(), 
+              order = character(),
+              family = character(), 
+              genus = character(),
+              species = character()
+              )
+
+n <- 0
+tot <- nrow(data_calculus)
+fail_taxa <- c()
+
+for(i in data_calculus$X.Datasets) {
+ print(paste(i," - ", format(round((n / tot) * 100), nsmall = 2), "%", sep = ""))
+ n <- n + 1
+ taxonomy_temp <-taxonomy_to_tibble(i)
+ 
+ if (length(taxonomy_temp) == 1) {
+  fail_taxa <-append(fail_taxa, i)
+ } else {
+   taxonomy_summary <- bind_rows(taxonomy_summary, taxonomy_temp)
+ }
+}
+
+# Manually fix failed taxa 
+taxonomy_summary <- taxonomy_summary %>%
+  add_row(taxon = "Pseudomonas sp. URMO17WK12:I11", phylum = "Proteobacteria") %>%
+  add_row(taxon = "Clavibacter insidiosus", phylum = "Actinobacteria") %>%
+  add_row(taxon = "Clavibacter nebraskensis", phylum = "Actinobacteria") %>%
+  add_row(taxon = "Clavibacter sepedonicus", phylum = "Actinobacteria") %>%
+  add_row(taxon = "Arthrobacter sp. ERGS1:01", phylum = "Actinobacteria")
+
+# Save this file to use in the future
+save(taxonomy_summary, file = paste("<PATH_TO_FILE>", format(Sys.Date(), "%Y%m%d"),".robj", sep = ""))
+```
+
+Add taxonomy to dataset
+
+```{r}
+# Load previously made taxonomy table
+load("<PATH_TO_FILE>")
+
+# Add taxonomy to data file, keeping only species and phylum columns
+data_taxonomy <- left_join(data_calculus, taxonomy_summary,
+                           by=c("X.Datasets"="taxon")) %>%
+  dplyr::select(-c(superkingdom, kingdom, class, order, family, genus, species))
+```
+
+Only phyla with >5% of species in any sample will be specified, the rest go under "other". 
+ 
+```{r}
+# Calculate number of species per phylum, ignoring samples
+data_taxonomy_long <- data_taxonomy %>%
+  gather(SampleID, abundance, 2:25)
+species_phylum <- data_taxonomy %>%
+  group_by(phylum) %>%
+  summarize(total_species=n())
+
+# Normalize species per phylum by total number of species
+species_phylum_norm <- as.data.frame(scale(species_phylum[2], center=FALSE, scale=colSums(species_phylum[2])))
+species_phylum_norm$phylum <- species_phylum$phylum
+
+# Add column where only >5% phyla are called by name
+data_taxonomy_long$corr_phylum <- data_taxonomy_long$phylum
+
+# Classify all <5% phyla into "Other"
+data_taxonomy_long <- data_taxonomy_long %>% 
+  mutate(corr_phylum = gsub("Acidobacteria|Armatimonadetes|Arthropoda|candidate division NC10|Candidatus Saccharibacteria|Chlorobi|Chloroflexi|Cyanobacteria|Deinococcus-Thermus|Elusimicrobia|Euryarchaeota|Fusobacteria|Gemmatimonadetes|Nematoda|Nitrospirae|Planctomycetes|Porifera|Spirochaetes|Streptophyta|Synergistetes|Tenericutes|Thaumarchaeota|Verrucomicrobia|NA", "Other", corr_phylum))
+data_taxonomy_long$corr_phylum[is.na(data_taxonomy_long$corr_phylum)] <- "Other"
+
+# Calculate number of species per phylum without RUV001
+data_taxonomy_noruv <- data_taxonomy %>%
+    dplyr::select(-c(RUV001.A1101, RUV001.A1401, RUV001.A0201, RUV001.A0601))
+data_taxonomy_noruv <- data_taxonomy_noruv[rowSums(data_taxonomy_noruv[2:21]) !=0, ]
+species_phylum_noruv <- data_taxonomy_noruv %>%
+  group_by(phylum) %>%
+  summarize(total_species=n())
+
+# Normalize species per phylum by total number of species without RUV001
+species_phylum_norm_noruv <- as.data.frame(scale(species_phylum_noruv[2],
+                                    center=FALSE,
+                                    scale=colSums(species_phylum_noruv[2])))
+species_phylum_norm_noruv$phylum <- species_phylum_noruv$phylum
+```
+
+## Stats
+
+Let's first compare total species number in each protocol and weight. 
+```{r}
+# Add metadata to taxonomy
+data_taxonomy_meta <- left_join(data_taxonomy_long, metadata) %>%
+  filter(!abundance==0)
+
+# Save dataset for easier future access
+write.table(data_taxonomy_meta, "<PATH_TO_FILE>", row.names = FALSE)
+
+# Summarize data to only show total species number
+species_summary <- data_taxonomy_meta %>%
+  group_by(Category, Weight, Protocol, Individual, SampleID) %>%
+  summarize(total_species=n())
+
+# Mean number of species for RUV001
+species_ruv <- species_summary %>%
+  filter(Individual=="RUV001")
+mean(species_ruv$total_species)
+sd(species_ruv$total_species)
+
+# Mean number of species for other samples
+species_noruv <- species_summary %>%
+  filter(!Individual=="RUV001")
+mean(species_noruv$total_species)
+sd(species_noruv$total_species)
+
+# Test without RUV001
+species_summary_noruv <- species_summary %>%
+  filter(!Individual=="RUV001")
+species_signif_test_noruv <- pairwise.wilcox.test(species_summary_noruv$total_species, species_summary_noruv$Category, p.adjust.method = "BH")
+species_signif_test_noruv
+```
+ 
+### Plot
+
+Prepare for plotting
+
+```{r}
+# Load previously created dataset
+data_taxonomy_meta <- read.table("<PATH_TO_FILE>",header = TRUE)
+
+# Set order for phyla for plot
+data_taxonomy_meta$corr_phylum <- factor(data_taxonomy_meta$corr_phylum, levels=c("Actinobacteria", "Bacteroidetes", "Firmicutes", "Proteobacteria", "Other"))
+
+# Set order of categories for plot
+data_taxonomy_meta$Category <- factor(data_taxonomy_meta$Category, levels=c("DO10", "UP10", "DO2", "UP2"))
+
+# Set colors per phylum
+my_colors = c("#AA4499", "#6699CC", "#332288", "#44AA99", "#888888")
+names(my_colors) <- data_taxonomy_meta$corr_phylum %>% unique %>% sort
+
+# Order individual by age
+data_taxonomy_meta$Individual <- factor(data_taxonomy_meta$Individual, levels=c("DRT001", "SMD017", "SMD046", "SMD051", "WIG001", "RUV001"))
+```
+
+Stacked boxplot
+
+```{r}
+species_nr <- ggplot(data_taxonomy_meta, aes(x=Category)) +
+  geom_bar(aes(fill=corr_phylum), colour="black") +
+  ylab("Species") +
+  xlab("Category") +
+  facet_grid(~Individual) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 90, hjust=0.95,vjust=0.2)) +
+  scale_fill_manual(values=my_colors, name="Phylum") 
+```
+
+# Stats
+
+```{r}
+# Summarize by number of species per phylum
+phylum_summary <- data_taxonomy_meta %>%
+  group_by(SampleID, Category, Weight, Protocol, Individual, corr_phylum) %>%
+  summarize(total_species=n())
+
+# Separate out RUV001
+phylum_summary_noruv <- phylum_summary %>%
+  filter(!Individual=="RUV001")
+
+# Turn into wide format
+phylum_summary_wide <- phylum_summary_noruv %>%
+  spread(corr_phylum, total_species, fill=0)
+
+# Create column for total numer of species
+phylum_summary_wide$total <- rowSums(phylum_summary_wide[ ,6:10])
+
+# Normalize GO-groups by total number of clusters
+phylum_summary_wide <- phylum_summary_wide %>%
+  mutate_at(6:10, list(~./total))
+
+# Change into long format
+phylum_norm <- phylum_summary_wide %>%
+  gather(phylum, proportion, 6:10)
+
+# Apply statistical test to GO group
+wilcox.phylum <- function(x) {
+  broom::tidy(pairwise.wilcox.test(x$proportion, x$Category, p.adjust.method = "BH"))
+}
+results_phyla <- phylum_norm %>%
+  group_by(phylum) %>%
+  group_map(~ wilcox.phylum(.x)) 
+
+# NOTE: Since we use proportions here, and the values are dependent on each other, further p-value correction is needed. However, since nothing is significant, further corrections will not be performed here. 
+```
+
+
+# Top 20 species
+
+This part calculates which species are the top 20 most abundant in the samples, and plots their proportion in each sample. Input data is the same as in the previous part.
+
+## Fix input data
+
+```{r}
+# Fix sample IDs
+colnames(raw_data) <- gsub(".SG1.1_S0_L001_R1_001.fastq.combined.fq.prefixed.extractunmapped.bam", "", colnames(raw_data))
+
+# Remove blanks
+data <- raw_data %>% 
+  dplyr::select(-c(EXB037.A0401, EXB037.A0501, EXB037.A0601, EXB037.A0701, EXB037.A0801, LIB030.A0101, LIB030.A0103, LIB030.A0104, LIB030.A0105))
+
+# Remove contaminants
+data_calculus <- anti_join(data, contaminants, by=c("X.Datasets" = "species"))
+```
+
+## Calculate abundance for species in each sample, with and without RUV001
+
+Abundance is calculated as average abundance across all samples per species. RUV001 has a very different profile, and the top 20 species will be calculated without this individual.
+
+```{r}
+# Remove RUV001 samples
+data_noruv <- data_calculus %>%
+  dplyr::select(-c(RUV001.A1101, RUV001.A1401, RUV001.A0601, RUV001.A0201))
+
+# Normalize reads by total read count per sample
+data_norm_noruv <- as.data.frame(scale(data_noruv[2:21], center=FALSE,
+                                       scale=colSums(data_noruv[2:21])))
+data_norm_noruv$Species <- data_noruv$X.Datasets
+
+# Calculate average abundance
+data_norm_noruv$ave_abundance <- rowMeans(data_norm_noruv[1:20])
+
+# Order by average abundance
+data_norm_noruv <-data_norm_noruv[order(-data_norm_noruv$ave_abundance),]
+
+# Choose 20 most abundant species
+top20_noruv <- data_norm_noruv[1:20, ]
+```
+
+## Plotting
+
+Data will be presented as a heatmap of species abundances across all samples.
+
+```{r}
+# Select only species column
+top20 <- top20_noruv %>%
+  dplyr::select(c(Species))
+
+# Subset normalized data for only top 20 species
+top20_norm <- left_join(top20, data_norm) %>%
+  dplyr::select(-c(ave_abundance))
+
+# Change data into long format
+top20_norm_long <- top20_norm %>%
+  gather(SampleID, proportion_reads, 2:25)
+
+# Add metadata
+top20_norm_long <- left_join(top20_norm_long, metadata)
+
+# Save data for easier future access
+write.table(top20_norm_long, "<PATH_TO_FILE>", row.names = FALSE)
+
+# Set order of categories 
+top20_norm_long$Category <- factor(top20_norm_long$Category,
+                                   levels=c("DO10", "UP10", "DO2", "UP2"))
+
+# Make percentage column
+top20_norm_long$Percentage <- top20_norm_long$proportion_reads * 100
+
+# Order individual by age
+top20_norm_long$Individual <- factor(top20_norm_long$Individual, levels=c("DRT001", "SMD017", "SMD046", "SMD051", "WIG001", "RUV001"))
+```
+
+Set aesthetics
+```{r}
+# Load previously made dataset
+top20_norm_long <-read.table("<PATH_TO_FILE>", header = TRUE)
+
+# Set order of categories 
+top20_norm_long$Category <- factor(top20_norm_long$Category,
+                                   levels=c("DO10", "UP10", "DO2", "UP2"))
+
+# Make percentage column
+top20_norm_long$Percentage <- top20_norm_long$proportion_reads * 100
+
+# Order individual by age
+top20_norm_long$Individual <- factor(top20_norm_long$Individual, levels=c("DRT001", "SMD017", "SMD046", "SMD051", "WIG001", "RUV001"))
+```
+
+Create plot
+
+```{r}
+heatmap <- ggplot(top20_norm_long, aes(Category, y=reorder(Species, proportion_reads))) + 
+  geom_tile(aes(fill = Percentage), colour = "white") + 
+  coord_equal() +
+  scale_fill_gradient(low = "white", high = "#332288", 
+                      name="Percentage of total reads") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, hjust=0.95, vjust=0.2),
+        axis.text=element_text(size=7)) +
+  ylab("") +
+  facet_grid(~ Individual) 
+```
+
+## Stats
+
+## Statistics
+
+Significant differences in abundance will be tested by doind a pairwise Wilcoxon rank sum test with Benjamini-Hochberg correction for each of the top 20 species.
+
+```{r}
+# Apply statistical test to each species
+wilcox.top20 <- function(x) {
+  broom::tidy(pairwise.wilcox.test(x$proportion_reads, x$Category, p.adjust.method = "BH"))
+}
+
+results_top20 <- top20_norm_long %>%
+  group_by(Species) %>%
+  group_map(~ wilcox.top20(.x)) 
+
+# NOTE: Since we use proportions here, and the values are dependent on each other, further p-value correction is needed. However, since nothing is significant, further corrections will not be performed here. 
+```
+
+# PCA
+
+This part was originally written by James Fellows Yates and was adapted to this project by Zandra Fagernaes.
+
+## Data
+
+Load raw data, remove contaminants and clean up. Two different PCA's will be made, one with and one without RUV001.
+
+```{r}
+# Load OTU table 
+raw_data <- read.delim("<PATH_TO_FILE>")
+
+# Load contaminant list
+decontam <- read.csv("<PATH_TO_FILE>", sep="")
+
+# Load metadata file and remove blanks, order in alphabetical order
+meta <- read.delim("<PATH_TO_FILE>") %>%
+  dplyr::filter(!Individual %in% c("EXB037", "LIB030"))
+meta <- meta[order(meta$SampleID),] 
+
+# Remove contaminants
+data_calculus <- anti_join(raw_data, decontam, by=c("X.Datasets"="genus"))
+
+# Remove blanks
+data_calculus <- data_calculus %>%
+  dplyr::select(-starts_with("EXB")) %>%
+  dplyr::select(-starts_with("LIB"))
+
+# Create dataset without RUV001
+data_calculus_noruv <- data_calculus %>%
+  dplyr::select(-starts_with("RUV"))
+
+# Remove species that were only present in blanks or RUV001
+data_calculus <- data_calculus[rowSums(data_calculus[2:25]) !=0, ] 
+data_calculus_noruv <- data_calculus_noruv[rowSums(data_calculus_noruv[2:21]) !=0, ]
+
+# Turn the dataframes into long format
+megan_genus <- gather(data_calculus, sample, count, 2:ncol(data_calculus))
+colnames(megan_genus) <- c("genus", "LibraryID", "estimated_count")
+
+megan_genus_noruv <- gather(data_calculus_noruv, sample, count, 2:ncol(data_calculus_noruv))
+colnames(megan_genus_noruv) <- c("genus", "LibraryID", "estimated_count")
+
+# Remove the parts that MEGAN adds to the library name
+megan_genus <- megan_genus %>% 
+  mutate(LibraryID = gsub("_S0_L001_R1_001.fastq.combined.fq.prefixed.extractunmapped.bam", "", LibraryID)) %>%
+  mutate(LibraryID = gsub("MeganServer..", "", LibraryID))
+megan_genus_noruv <- megan_genus_noruv %>% 
+  mutate(LibraryID = gsub("_S0_L001_R1_001.fastq.combined.fq.prefixed.extractunmapped.bam", "", LibraryID)) %>%
+  mutate(LibraryID = gsub("MeganServer..", "", LibraryID))
+```
+
+# Prepare data
+
+Set up metadata, which means making data that mimics the one used within each normalisation and PCA function, and adding metadata.
+
+```{r}
+# Turn data back into wide format, but with genus as columns and libraries as rows
+megan_genus_wide <- spread(megan_genus, genus, estimated_count, fill = 0)
+megan_genus_wide_noruv <- spread(megan_genus_noruv, genus, estimated_count, fill = 0)
+
+# Combine metadata and data file
+megan_genus_wide_meta <- left_join(megan_genus_wide, meta)
+megan_genus_wide_meta_noruv <- left_join(megan_genus_wide_noruv, meta)
+```
+
+# Zero replacement, log ratio transform and PCA Functions
+
+Follow tutorial by Greg Gloor et al. for the multiplicative simple replacement zero-count correction and centered log ratio normalisation from [https://github.com/ggloor/CoDa_microbiome_tutorial/wiki/Part-1:-Exploratory-Compositional-PCA-biplot], and put in a function.
+
+```{r}
+# Multiplicative zero replacement, with CLR transformation function "gloor"
+czm_clr_pca <- function(in_data){
+  ## Convert data to a matrix
+  wide_data <- in_data %>% 
+    dplyr::select(genus, LibraryID, estimated_count) %>% 
+    spread(genus, estimated_count, fill = 0)
+  matrix <- as.matrix(wide_data[2:ncol(wide_data)])
+  rownames(matrix) <- wide_data$library_name
+  ## Zero imputation through multiplicative simple replacement (estimated)
+  matrix.czm <- cmultRepl(matrix, label=0, method="CZM")
+  matrix.clr <- t(apply(matrix.czm, 1, function(x){log(x) - mean(log(x))}))
+  return(prcomp(matrix.clr))
+}
+
+# Apply function to data
+gloor_pca <- czm_clr_pca(megan_genus)
+gloor_pca_noruv <- czm_clr_pca(megan_genus_noruv)
+```
+
+# Loadings
+
+To see what is driving the variation in the samples, we can take a closer look at the loadings of the PCA object.
+
+```{r}
+# Get variables with biggest impact for PC1 and PC2
+gloor_pca$rotation[,1] %>% sort() %>% head(2)
+gloor_pca$rotation[,1] %>% sort(decreasing = TRUE) %>% head(2)
+gloor_pca$rotation[,2] %>% sort() %>% head(2)
+gloor_pca$rotation[,2] %>% sort(decreasing = TRUE) %>% head(2)
+
+# And same for PCA without RUV001
+gloor_pca_noruv$rotation[,1] %>% sort() %>% head(2)
+gloor_pca_noruv$rotation[,1] %>% sort(decreasing = TRUE) %>% head(2)
+gloor_pca_noruv$rotation[,2] %>% sort() %>% head(2)
+gloor_pca_noruv$rotation[,2] %>% sort(decreasing = TRUE) %>% head(2)
+
+# Get rownames
+which(rownames(gloor_pca_noruv$rotation) %in% c("Chryseobacterium", "Pasteurella"))
+
+# Create matrix of x (PC1) coordinates and y (PC2) and multiply by 100
+l.x <- cbind(gloor_pca$rotation[,1][c(151, 175, 379, 398, 154, 192, 137, 333)]) *100
+l.y <- cbind(gloor_pca$rotation[,2][c(151, 175, 379, 398, 154, 192, 137, 333)]) *100
+
+# Create matrix of coordinates without RUV001
+l.x.2 <- cbind(gloor_pca_noruv$rotation[,1][c(85, 105, 78, 165, 51, 146, 117, 194)]) *100
+l.y.2 <- cbind(gloor_pca_noruv$rotation[,2][c(85, 105, 78, 165, 51, 146, 117, 194)]) *100
+```
+
+# Plotting 
+
+```{r}
+# Extract values
+pca_out <- as_tibble(gloor_pca$x)
+pca_out$LibraryID <- megan_genus_wide_meta$LibraryID
+pca_out_meta <- left_join(pca_out, meta)
+
+pca_out_noruv <- as_tibble(gloor_pca_noruv$x)
+pca_out_noruv$LibraryID <- megan_genus_wide_meta_noruv$LibraryID
+pca_out_meta_noruv <- left_join(pca_out_noruv, meta)
+
+# Calculate percent explained per PC
+percentage <- round(gloor_pca$sdev / sum(gloor_pca$sdev) * 100, 2)
+percentage <- paste(colnames(pca_out), "(", paste( as.character(percentage), "%", ")", sep="") )
+
+percentage_noruv <- round(gloor_pca_noruv$sdev / sum(gloor_pca_noruv$sdev) * 100, 2)
+percentage_noruv <- paste(colnames(pca_out_noruv), "(", paste( as.character(percentage_noruv), "%", ")", sep="") )
+
+# Set colours for individuals
+my_colors = c("#999933", "#888888", "#6699CC", "#332288", "#44AA99", "#AA4499")
+names(my_colors) = pca_out_meta$Individual %>% unique %>% sort
+
+# Set shapes for categories
+my_shapes = c(19, 1, 17, 2)
+names(my_shapes) = pca_out_meta$Category %>% unique %>% sort
+```
+
+And plot with loadings:
+
+```{r}
+pca_all <- ggplot(data = pca_out_meta, 
+       aes(x = PC1, y = PC2, colour=Individual, shape=Category)) +
+  geom_point(size=4, stroke=3) +
+  scale_shape_manual(values=my_shapes) +
+  scale_color_manual(values=my_colors) +
+  xlab(percentage[1]) + 
+  ylab(percentage[2]) +
+  guides(fill=guide_legend(override.aes=list(shape=21, size=5))) +
+  theme_minimal() +
+  annotate("segment", x=0, xend=l.x, y=0, yend=l.y, colour="black",
+           size=1, arrow=arrow()) + 
+  annotate("text", x=l.x, y=l.y, label=rownames(l.x), color="red")
+
+pca_noruv <- ggplot(data = pca_out_meta_noruv, 
+       aes(x = PC1, y = PC2, colour=Individual, shape=Category)) +
+  geom_point(size=4, stroke=3) +
+  scale_shape_manual(values=my_shapes) +
+  scale_color_manual(values=my_colors) +
+  xlab(percentage_noruv[1]) + 
+  ylab(percentage_noruv[2]) +
+  guides(fill=guide_legend(override.aes=list(shape=21, size=5))) +
+  theme_minimal() +
+  annotate("segment", x=0, xend=l.x.2, y=0, yend=l.y.2, colour="black",
+           size=1, arrow=arrow()) + 
+  annotate("text", x=l.x.2, y=l.y.2, label=rownames(l.x.2),
+           color="red")
+```
+
+# PERMANOVA
+
+In order to see if the groupings are significantly different from each other, we will perform a PERMANOVA using the R package 'vegan'. Input data is sequence counts normalized in the same way as in the PCA above.
+
+```{r}
+# Remove RUV001 from metadata file
+meta_noruv <- meta %>%
+  filter(!Individual=="RUV001")
+
+# Turn data into matrix
+matrix <- as.matrix(megan_genus_wide_noruv[2:ncol(megan_genus_wide_noruv)])
+rownames(matrix) <- megan_genus_wide_noruv$LibraryID
+  
+# Zero imputation through multiplicative simple replacement (estimated)
+matrix.czm <- cmultRepl(matrix, label=0, method="CZM")
+matrix.clr <- t(apply(matrix.czm, 1, function(x){log(x) - mean(log(x))}))
+```
+
+And then we run the test.
+```{r}
+# Basic permanova with euclidean distance as metric
+permanova <- adonis(matrix.clr ~ Individual + Weight + Protocol, 
+                    data=meta_noruv,
+                    permutations=999,
+                    method="euclidean")
+permanova
+```
+
+We also need to check that the variance homogeneity assumptions hold.
+
+```{r}
+dist <- vegdist(megan_genus_wide_noruv[2:204])
+anova(betadisper(dist, meta_noruv$Individual))
+```
+
+# Combine plots
+
+All of these plots will be combined into one figure, except for the PCA with RUV001, which will be placed in the supplement.
+
+```{r}
+fig4 <- plot_grid(species_nr, 
+                  plot_grid(heatmap, pca_noruv, labels = c('B', 'C'), 
+                            label_size = 12, ncol = 2),
+                  labels = c('A', ''), label_size = 16, nrow = 2)
+  
+```

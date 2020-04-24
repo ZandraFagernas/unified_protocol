@@ -1,0 +1,404 @@
+---
+title: "Protein characteristics"
+output: html_notebook
+author: "Zandra Fagernaes"
+---
+
+This is a walkthrough of all the protein characteristics analyses for the paper "A unified protocol for simultaneous extraction of DNA and proteins from archaeological dental calculus" (Fagernaes et al. 2020). The data is summarized in figure 7 and supplementary material. Individual RUV001 in not included in any statistics, as stated in the paper.
+
+```{r echo = FALSE}
+library(janitor)
+library(fuzzyjoin)
+library(readxl)
+library(reshape2)
+library(gtools)
+library(ggsignif)
+library(ggpubr)
+library(Peptides)
+library(tidyverse)
+```
+
+## Hydrophobicity
+
+Here, we will investigate the hydrophobicity of the proteins identified through LC-MS/MS. The web application GRAVY (http://www.gravy-calculator.de) was used to calculate hydrophobicity (see details in paper).
+
+### Import data
+
+```{r}
+# Import protein report
+protein_report <- read.delim("<PATH_TO_FILE>") %>%
+  janitor::clean_names() 
+
+# Results from GRAVY
+gravy <- read_excel("<PATH_TO_FILE>") %>%
+  janitor::clean_names() 
+
+# Metadata
+UP_metadata_prot <- read.delim("<PATH_TO_FILE>")
+```
+
+Clean GRAVY file
+
+```{r}
+# Remove reverse hits and keep only Uniprot identifier
+gravy <- gravy %>%
+  filter(!str_detect(header, 'rr//|REV')) %>%
+  separate(header, c("accession", "remove"), " ") %>%
+  separate(accession, c("r1", "r2", "protein_accession_numbers"), "[|]") %>%
+  dplyr::select(-c(remove, r1, r2)) 
+```
+
+Clean protein report file
+
+```{r}
+# Select only necessary columns
+data <- protein_report %>%
+  dplyr::select(c(ms_ms_sample_name, protein_accession_numbers, 
+           percentage_of_total_spectra, protein_name))
+
+# Fix sample IDs
+data <- data %>%
+  separate(ms_ms_sample_name, c("SampleID", "remove"), " ") %>%
+  separate(SampleID, c("SampleID", "remove2"), "_") %>%
+  dplyr::select(-c(remove, remove2)) 
+
+# Remove reverse hits and contaminants
+data <- data %>%
+  filter(!str_detect(protein_accession_numbers, 'rr//|REV')) %>%
+  filter(!str_detect(protein_name, "Collagen|Keratin|Serum albumin"))
+```
+
+### Assign hydropathy value to identified proteins
+
+Since the protein report contains multiple accessions for each protein, we can't just join the datasets based on accession. The R package fuzzyjoin is thereby used to use regular expressions to assign a hydropathy value to each protein in the protein report. 
+
+In cases where several protein accessions are given for a protein (i.e. when several proteins are matched), the mean hydropathy of these proteins are used.
+
+```{r}
+# Combine datasets
+data_gravy <- regex_left_join(data, gravy, by="protein_accession_numbers")
+
+# Average over proteins when several accessions are given
+data_gravy <- data_gravy %>%
+  group_by(SampleID, protein_accession_numbers.x, percentage_of_total_spectra) %>%
+  summarize(mean_gravy = mean(gravy))
+
+# Add metadata
+data_gravy_meta <- left_join(data_gravy, UP_metadata_prot)
+
+# Calculate mean per individual and category
+data_gravy_summary <- data_gravy_meta %>%
+  group_by(SampleID, Category, Weight, Protocol, Individual) %>%
+  summarize(mean_hydro=mean(mean_gravy, na.rm=TRUE))
+```
+
+### Stats
+
+Significances of changes in mean hydrophobicity between the protocols/starting weights are calculated with a pairwise Wilcoxon test, and corrected with the Benjamini-Hochberg method for multiple testing.
+
+```{r}
+# Remove RUV001 and test
+data_gravy_summary_noruv <- data_gravy_summary %>%
+  filter(!Individual=="RUV001")
+hydro_signif_test_noruv <- pairwise.wilcox.test(data_gravy_summary_noruv$mean_hydro, data_gravy_summary_noruv$Category, p.adjust.method = "BH")
+hydro_signif_test_noruv 
+```
+
+### Plot boxes
+
+Set aesthetics
+
+```{r}
+# Set colors per individual
+my_colors = c("#999933", "#888888", "#6699CC", "#332288", "#44AA99", "#AA4499")
+names(my_colors) = data_gravy_summary$Individual %>% unique %>% sort
+
+# Function for getting same number of decimals in plots
+formatter <- function(...){
+  function(x) format(round(x, 1), ...)
+}
+```
+
+Plot!
+
+```{r}
+hydro_plot <-ggplot(data_gravy_summary, aes(x=Category, y=mean_hydro)) +
+  geom_boxplot(outlier.shape=NA) +
+  geom_jitter(position=position_jitterdodge(dodge.width=0.3),
+              aes(color=Individual), shape= 19, size=4) +
+  scale_color_manual(values=my_colors) +
+  scale_x_discrete(limits=c("PO10", "UP10", "PO2", "UP2")) +
+  ylab("Hydropathy index") +
+  theme_minimal(base_size = 12)
+```
+
+
+## Amino acid composition
+
+In order to make sure that the protocol is not biasing against some type of amino acids, the amino acid composition of the identified peptides was calculated. This was done on a peptide report exported through Scaffold.
+
+```{r}
+# Load and clean data
+peptide_report <- read.delim("<PATH_TO_FILE>") %>%
+  janitor::clean_names() %>%
+  select("biological_sample_name", "ms_ms_sample_name", "protein_name", "protein_accession_numbers", "percentage_of_total_spectra", "peptide_sequence") %>%
+  separate(ms_ms_sample_name, c("SampleID", "remove"), " ") %>%
+  select(-c(remove)) %>%
+  separate(SampleID, c("SampleID", "remove"), "_") %>%
+  select(-c(remove)) 
+
+# Remove reverse hits and contaminants 
+peptide_report <- peptide_report %>%
+  filter(!str_detect(protein_accession_numbers, 'rr//|REV')) %>%
+  filter(!str_detect(protein_name, "Collagen|Keratin|Serum albumin"))
+
+# Load metadata
+UP_metadata_prot <- read.delim("<PATH_TO_FILE>")
+```
+
+Now we need to create separate datasets for each sample, deduplicate the peptides and concatenate them into one long sequence. We can then analyze this "super-peptide" with the Peptides package (Osorio et al. 2015).
+
+**NOTE: This is still done one sample at a time, I need to ask someone R-proficient how to make it into a loop**
+
+```{r}
+# Create data set per sample
+sample <- peptide_report %>%
+  filter(SampleID=="<SAMPLEID>") %>%
+  distinct(peptide_sequence, .keep_all = TRUE)
+
+# Concatenate all peptides into one
+super_pep=NULL
+for (i in sample$peptide_sequence) super_pep<-paste0(super_pep,i)
+
+# Calculate amino acid composition of super-peptide
+sample_aa <- as.data.frame(aaComp(super_pep)) %>%
+  tibble::rownames_to_column("aa_type")
+
+# Add sample to list of all amino acid compositions
+sample_aa$SampleID <- "<SAMPLEID>"
+aa_comp <- rbind(aa_comp, sample_aa)
+
+aa_comp <- sample_aa #Only needs to be done first time 
+```
+
+Now save the file so it doesn't need to be done every time.
+
+```{r}
+write.table(aa_comp, "<PATH_TO_FILE>")
+```
+
+And now let's check if there are any statistical differences in the proportion of each amino acid type with a pairwise Wilcoxon test, corrected with the Benjamini-Hochberg method for multiple testing.
+
+```{r}
+# Load previously created file
+UP_peptide_aa_comp <- read.csv("<PATH_TO_FILE>", sep="")
+
+# Add metadata
+aacomp_meta <- left_join(UP_peptide_aa_comp, UP_metadata_prot)
+
+# Remove RUV001
+aacomp_meta_noruv <- aacomp_meta %>%
+  filter(!Individual=="RUV001")
+
+### NOTE: This is still done one amino acid type at a time, I need to ask someone R-proficient how to make it into a loop ###
+
+# Apply statistical test to each amino acid type
+aa <- aacomp_meta_noruv %>%
+  filter(aa_type=="Basic")
+aa_test <- tidy(pairwise.wilcox.test(aa$Mole., aa$Category, p.adjust.method = "BH"))
+
+# Add sample to list of all amino acid compositions
+aa_test$aa_type <- "Basic"
+aa_results <- rbind(aa_test, aa_results)
+
+aa_results <- aa_test #Only needs to be done first time 
+```
+
+Only the basic amino acids will be shown in the plot, since they have the clearest pattern. Acidic amino acids will be shown in supplementary figure.
+
+```{r}
+### Basic
+
+# Subset to only basic amino acids
+basic_aa <- aacomp_meta %>%
+  filter(aa_type=="Basic")
+
+# Extract only significant comparisons
+aa_results_basic <- aa_results %>%
+  filter(aa_type == "Basic")
+significant_aa_basic <- aa_results_basic$p.value %>% melt() %>% filter(value < 0.05)
+
+# Add asterisks to represent significance
+significant_aa_basic$stars <- stars.pval(significant_aa_basic$value)
+
+### Acidic
+
+# Subset to only acidic amino acids
+acidic_aa <- aacomp_meta %>%
+  filter(aa_type=="Acidic")
+
+# Extract only significant comparisons
+aa_results_acidic <- aa_results %>%
+  filter(aa_type == "Acidic")
+significant_aa_acidic <- aa_results_acidic$p.value %>% melt() %>% filter(value < 0.05)
+
+# Add asterisks to represent significance
+significant_aa_acidic$stars <- stars.pval(significant_aa_acidic$value)
+```
+
+Now this can be added to a plot.
+
+```{r}
+# Set colors per individual
+my_colors = c("#DDCC77", "#888888", "#6699CC", "#332288", "#44AA99", "#AA4499")
+names(my_colors) <- basic_aa$Individual %>% unique %>% sort
+
+# Function for getting same number of decimals in plots
+formatter <- function(...){
+  function(x) format(round(x, 1), ...)
+}
+```
+
+Plot!
+```{r}
+basic_plot <- ggplot(basic_aa, aes(x=Category, y=Mole.)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(position=position_jitterdodge(dodge.width=0.3),
+              aes(color=Individual), shape=19, size=4) +
+  scale_color_manual(values=my_colors) +
+  geom_signif(comparisons = list(c("UP10", "PO10"), c("UP2", "PO10"),
+                                 c("UP10", "PO2"), c("UP2", "PO2")),
+              annotations = significant_aa_basic$stars, 
+              y_position = c(15, 15.6, 15.2, 15.4)) +
+  scale_x_discrete(limits=c("PO10", "UP10", "PO2", "UP2")) +
+    scale_y_continuous(labels = formatter(nsmall = 1)) +
+  ylab("Basic amino acids (%)") +
+  theme_minimal(base_size = 12)
+```
+
+Plot!
+```{r}
+acidic_plot <- ggplot(acidic_aa, aes(x=Category, y=Mole.)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(position=position_jitterdodge(dodge.width=0.3),
+              aes(color=Individual), shape=19, size=4) +
+  scale_color_manual(values=my_colors) +
+  geom_signif(comparisons = list(c("UP2", "PO10")),
+              annotations = significant_aa_acidic$stars, 
+              y_position = 14.5) +
+  scale_x_discrete(limits=c("PO10", "UP10", "PO2", "UP2")) +
+  scale_y_continuous(labels = formatter(nsmall = 1)) +
+  ylab("Acidic amino acids (%)") +
+  theme_minimal(base_size = 12)
+```
+
+
+## Molecular weight
+
+Input data is the "Protein report" from Scaffold. This will be a supplementary figure.
+
+### Load data
+
+```{r}
+# Protein report
+protein_report <- read.delim("<PATH_TO_FILE>") %>%
+  janitor::clean_names() 
+
+# Metadata
+UP_metadata_prot <- read.delim("<PATH_TO_FILE>")
+```
+
+### Data cleanup
+
+```{r}
+# Fix sample IDs
+data <- protein_report %>%
+  separate(ms_ms_sample_name, c("Sample", "remove"), " ") %>%
+  separate(Sample, c("SampleID", "remove2"), "_") %>%
+  dplyr::select(-c(remove, remove2)) 
+
+# Remove reverse hits and contaminants 
+data <- data %>%
+  filter(!str_detect(protein_accession_numbers, 'rr//|REV')) %>%
+  filter(!str_detect(protein_name, "Collagen|Keratin|Serum albumin"))
+
+# Change weight column into numeric and make it kDa
+data$protein_molecular_weight_da <- as.numeric(data$protein_molecular_weight_da)
+data$protein_molecular_weight_kda <- data$protein_molecular_weight_da/1000
+```
+
+### Calculate means
+
+```{r}
+# Select only necessary columns
+data_weight <- data %>%
+  dplyr::select(SampleID, protein_name,
+                protein_molecular_weight_kda)
+
+# Add metadata
+data_weight_meta <- left_join(data_weight, UP_metadata_prot)
+
+# Calculate mean per individual and category
+data_weight_summary <- data_weight_meta %>%
+  group_by(SampleID, Category, Weight, Protocol, Individual) %>%
+  summarize(mean_weight=mean(protein_molecular_weight_kda, na.rm=TRUE))
+
+# Calculate mean and sd for RUV001
+data_weight_summary_ruv <- data_weight_summary %>%
+  filter(Individual=="RUV001")
+mean(data_weight_summary_ruv$mean_weight)
+sd(data_weight_summary_ruv$mean_weight)
+
+# Calculate mean and sd for other individuals
+data_weight_summary_noruv <- data_weight_summary %>%
+  filter(!Individual=="RUV001")
+mean(data_weight_summary_noruv$mean_weight)
+sd(data_weight_summary_noruv$mean_weight)
+```
+
+### Stats
+
+Significances of changes in mean molecular weight between the protocols/starting weights are calculated with a pairwise Wilcoxon test, and corrected with the Benjamini-Hochberg method for multiple testing.
+
+```{r}
+# Without RUV001
+data_weight_summary_noruv <- data_weight_summary %>%
+  filter(!Individual=="RUV001")
+weight_noruv_signif_test <- pairwise.wilcox.test(data_weight_summary_noruv$mean_weight, data_weight_summary_noruv$Category, p.adjust.method = "BH")
+weight_noruv_signif_test 
+```
+
+### Box plot
+
+Set aesthetics
+```{r}
+# Set colors per individual
+my_colors = c("#DDCC77", "#888888", "#6699CC", "#332288", "#44AA99", "#AA4499")
+names(my_colors) <- data_weight_meta$Individual %>% unique %>% sort
+```
+
+Plot!
+```{r}
+weight_plot <- ggplot(data_weight_summary, aes(x=Category, y=mean_weight)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(position=position_jitterdodge(dodge.width=0.3),
+              aes(color=Individual), shape=19, size=4) +
+  scale_color_manual(values=my_colors) +
+  scale_x_discrete(limits=c("PO10", "UP10", "PO2", "UP2")) +
+  ylab("Molecular weight (kDa)") +
+  theme_minimal(base_size = 12)
+```
+
+
+## Combine plots
+
+Since these analyses will be in the same section of the paper, the plots will be combined into one figure. 
+
+```{r echo = FALSE}
+prot_hydro_fig <- ggarrange(hydro_plot, basic_plot,
+                           labels = c("A", "B"),
+                           ncol = 1, nrow = 2, 
+                           common.legend = TRUE, 
+                           legend = "right")
+
+```

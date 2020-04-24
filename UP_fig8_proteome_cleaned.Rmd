@@ -1,0 +1,630 @@
+---
+title: "Proteome analyses"
+output: html_notebook
+author: "Zandra Fagernaes"
+---
+
+This is a walkthrough of all the proteome analyses for the paper "A unified protocol for simultaneous extraction of DNA and proteins from archaeological dental calculus" (Fagernaes et al. 2020). The data is summarized in figure 8. Individual RUV001 in not included in any statistics, as stated in the paper.
+
+```{r, include=FALSE}
+library(janitor)
+library(readxl)
+library(vegan)
+library(ggpubr)
+library(broom)
+library(cowplot)
+library(tidyverse)
+```
+
+
+# Protein number and cellular location
+
+## Prepare data
+
+The input file is the 'samples view report' exported from a Scaffold file where GO annotations are shown. Note that Scaffold inserts a few lines above the header, and a line saying 'end of file' at the end, which I removed manually before starting the analyses.
+
+```{r}
+# Load data 
+raw_data <- read.delim("<PATH_TO_FILE>") %>%
+  janitor::clean_names() 
+metadata <- read.delim("<PATH_TO_FILE>")
+
+# Select only relevant columns
+# Note that ending numbers for identified proteins changes if the file is changed!
+data <- raw_data %>%
+  select(c("identified_proteins_786_797", "accession_number", 29:42, 62:85)) 
+colnames(data)[colnames(data)=="identified_proteins_786_797"] <- "identified_proteins"
+
+# Remove decoy hits, collagens and keratins
+data <- data %>%
+  filter(!str_detect(accession_number, 'rr//|REV')) %>%
+  filter(!str_detect(identified_proteins, "Collagen|Keratin|Serum albumin"))
+```
+
+## Modify GO-term columns
+
+Scaffold annotates proteins with GO-terms of cellular location, but they are nested and at various levels in the hierarchy. The output has many columns of different GO terms, with futher GO terms defined in the columns. Therefore,  we will summarize them so that only five main groups will remain:
+
+1. Intracellular/organelle (golgi, cytoskeleton, ER, endosome, intracellular organelle,     
+    mitochondrion, nucleus, organelle part, cytoplasm and ribosome columns)
+2. Membrane (membrane, plasma membrane and organelle membrane)
+3. Extracellular region
+4. Various (i.e. found in more than one of locations 1-3)
+5. NA (Information not available)
+
+Categories were defined by looking at ancestral terms for every column of GO terms at https://www.ebi.ac.uk/QuickGO/
+
+```{r}
+# Substitute GO terms in every column with the number 1
+data[ ,3:16] <- lapply(data[ ,3:16], function (x) gsub(" ", "", x))
+data[ ,3:16] <- lapply(data[ ,3:16], function (x) gsub("[[:graph:]]+", "1", x))
+data[ ,3:16] <- lapply(data[ ,3:16], as.numeric)
+
+# Combine GO categories into group 1-3
+
+## 1. Intracellular/organelle
+data$group_intra_organ <- data %>% 
+  select("golgi_apparatus", "cytoskeleton", "endoplasmic_reticulum", "endosome", "intracellular_organelle", "mitochondrion", "nucleus", "organelle_part", "cytoplasm", "ribosome") %>%
+  rowSums(na.rm=TRUE)
+
+## 2. Membranes
+data$group_membrane <- data %>%
+  select("membrane", "plasma_membrane", "organelle_membrane") %>%
+  rowSums(na.rm=TRUE)
+
+## 3. Extracellular
+data$group_extra <- data %>%
+  select("extracellular_region") %>%
+  rowSums(na.rm=TRUE)
+
+# Select only relevant columns for downstream analyses
+data_go <- data %>%
+  select("identified_proteins", "accession_number", "group_intra_organ", "group_membrane", "group_extra", 17:40)
+
+# Change count numbers in GO-groups to 0 or 1 (1 = anything larger than 0)
+data_go[ ,3:5] <- lapply(data_go[ ,3:5], function (x) gsub("^[1-9][0-9]*", "1", x))
+```
+
+## Assign one GO group to each protein cluster
+
+Now that our GO-terms are in a neat form, we need to assign just one GO-group to each protein cluster. We do this by creating a sum-column of the three groups. If it is 2-3, the cluster has more than one cellular location, and is classified into 4) Various. If it is 0, the cluster has no GO-location assigned, and gets classified into 5) NA. 
+
+```{r}
+# Create column for GO group, where groups 1-3 are summed
+data_go[3:5] <- lapply(data_go[3:5], as.numeric)
+data_go$group_var_na <- data_go %>%
+  select("group_intra_organ", "group_membrane", "group_extra") %>%
+  rowSums()
+
+# Assign groups 1-3
+data_go$GOgroup[data_go$group_intra_organ=="1"] <- "intra_organ"
+data_go$GOgroup[data_go$group_membrane=="1"] <- "membrane"
+data_go$GOgroup[data_go$group_extra=="1"] <- "extra"
+
+# Assign groups 4-5 based on sum column 
+data_go$GOgroup[data_go$group_var_na=="2"] <- "various"
+data_go$GOgroup[data_go$group_var_na=="3"] <- "various"
+data_go$GOgroup[data_go$group_var_na=="0"] <- "Unknown"
+
+# Select only necessary columns for final dataset
+data_final <- data_go %>%
+  select("accession_number", "GOgroup", 6:29)
+```
+
+## Summarise data
+
+```{r}
+# Change data into long format
+data_long <- data_final %>%
+  gather("SampleID", "percent_of_total_spectra", 3:26)
+
+# Fix sample IDs
+data_long <- data_long %>%
+  separate("SampleID", c("SampleID", "Remove"), sep="_") %>%
+  select(-c("Remove"))
+data_long$SampleID <- toupper(data_long$SampleID)
+
+# Remove percentage sign and change quant values to numeric
+data_long <- data_long %>%
+  mutate(percent_of_total_spectra = gsub("%", "", percent_of_total_spectra))
+data_long$percent_of_total_spectra <- as.numeric(data_long$percent_of_total_spectra)
+
+# Remove proteins without spectra
+data_long <- data_long[-which(data_long$percent_of_total_spectra==0), ]
+
+# Add metadata
+data_meta <- left_join(metadata, data_long, by="SampleID")
+
+# Save data for faster future plotting 
+write.table(data_meta, "<PATH_TO_FILE>", row.names = FALSE)
+
+# Summary for stats, by number of total protein clusters
+cluster_summary <- data_meta %>%
+  group_by(SampleID, Category, Weight, Protocol, Individual) %>%
+  summarize(total_clusters=n())
+
+# Calculate mean and sd for RUV001
+cluster_summary_ruv <- cluster_summary %>%
+  filter(Individual=="RUV001")
+mean(cluster_summary_ruv$total_clusters)
+sd(cluster_summary_ruv$total_clusters)
+
+# Calculate mean and sd for WIG001
+cluster_summary_wig <- cluster_summary %>%
+  filter(Individual=="WIG001")
+mean(cluster_summary_wig$total_clusters)
+sd(cluster_summary_wig$total_clusters)
+```
+
+## Stats
+
+Let's first check if there are differences in the total number of protein clusters.
+
+```{r}
+# Test without RUV001
+cluster_summary_noruv <- cluster_summary %>%
+  filter(!Individual=="RUV001")
+cluster_signif_test_noruv <-
+  pairwise.wilcox.test(cluster_summary_noruv$total_clusters,
+                       cluster_summary_noruv$Category, p.adjust.method = "BH")
+cluster_signif_test_noruv 
+```
+
+Now we can check if there are differences in specific GO-groups between the categories. For that, we will normalize the number of cluster per GO-group by the total number of clusters, in order to compare proportions instead of numbers.
+
+```{r}
+# Summary by GO-group, with RUV001 removed
+GO_summary <- data_meta %>%
+  group_by(SampleID, Category, Weight, Protocol, Individual, GOgroup) %>%
+  summarize(total_clusters=n()) %>%
+  filter(!Individual=="RUV001")
+
+# Turn into wide format
+GO_summary_wide <- GO_summary %>%
+  spread(GOgroup, total_clusters, fill=0)
+
+# Create column for total numer of clusters
+GO_summary_wide$total <- rowSums(GO_summary_wide[ ,6:10])
+
+# Normalize GO-groups by total number of clusters
+GO_summary_wide <- GO_summary_wide %>%
+  mutate_at(6:10, list(~./total))
+
+# Change into long format
+GO_norm <- GO_summary_wide %>%
+  gather(GOgroup, proportion, 6:10)
+
+# Apply statistical test to GO group
+wilcox.GO <- function(x) {
+  broom::tidy(pairwise.wilcox.test(x$proportion, x$Category, p.adjust.method = "BH"))
+}
+results_GO <- GO_norm %>%
+  group_by(GOgroup) %>%
+  group_map(~ wilcox.GO(.x)) 
+
+# NOTE: Since these proportions are dependent on each other, further p-value correction is necessary. However, since nothing is significant here, no further corrections will be done in this script.
+```
+
+## Plot
+
+Now that we have GO-groups for all identified protein clusters, we can create a plot to show them. However, we first need to transform the data into a form we can actually plot.
+
+```{r}
+# Load previously made data file
+cluster_data <- read.table( "<PATH_TO_FILE>", header = TRUE)
+
+# Order the GO groups
+cluster_data$GOgroup <- factor(cluster_data$GOgroup, 
+                               levels=c("intra_organ", "membrane", "extra", "various", "Unknown"))
+
+# Set order of categories 
+cluster_data$Category <- factor(cluster_data$Category, levels=c("PO10", "UP10", "PO2", "UP2"))
+
+# Set colors per GO-category 
+my_colors = c("#AA4499", "#6699CC", "#332288", "#44AA99", "#888888")
+names(my_colors) <- cluster_data$GOgroup %>% unique %>% sort
+
+# Re-order individuals from oldest to youngest
+cluster_data$Individual <- factor(cluster_data$Individual, 
+  levels=c("DRT001", "SMD017", "SMD046", "SMD051", "WIG001", "RUV001"))
+```
+
+Stacked barchart: 
+
+```{r}
+clusterplot <- ggplot(cluster_data, aes(Category)) +
+  geom_bar(aes(fill=GOgroup), colour="black") +
+  ylab("Protein clusters") +
+  xlab("Category") +
+  facet_grid(~Individual) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 90, hjust=0.95,vjust=0.2)) +
+  scale_fill_manual(values=my_colors,
+              name="GO group",
+              labels=c("Intracellular/organelle", "Membranes",
+                       "Extracellular", "Various", "Unknown"))
+```
+
+
+# Top 20 protein clusters
+
+## Import data
+
+Input data is a cluster report exported from Scaffold for all samples.
+
+```{r}
+#Import data
+raw_data <- read.delim("<PATH_TO_FILE>") %>%
+  janitor::clean_names() 
+
+# Import metadata
+UP_metadata_prot <- read.delim("<PATH_TO_FILE>")
+```
+
+### Data cleanup
+```{r}
+# Remove decoy hits and contaminants
+data <- raw_data %>%
+  filter(!str_detect(protein_accession_numbers, 'rr//|REV')) %>%
+  filter(!str_detect(protein_cluster, "Collagen|Keratin|Serum albumin"))
+
+# Select only necessary columns, fix sample names and remove percentage sign from values
+data <- data %>%
+  select(c(ms_ms_sample_name, protein_cluster, percentage_of_total_spectra)) %>%
+  separate(ms_ms_sample_name, c("SampleID", "remove"), "_") %>%
+  select(-c(remove)) %>%
+  mutate(percentage_of_total_spectra = gsub("%", "", percentage_of_total_spectra)) %>%
+  mutate(percentage_of_total_spectra = as.numeric(percentage_of_total_spectra))
+```
+
+### Find 20 most abundant protein clusters
+
+RUV001 will not be considered in seleting most abundant protein clusters, since it does not exhibit the same calculus profile as the other samples.
+
+```{r}
+# Turn data into wide format
+data_wide <- data %>%
+  spread(SampleID, percentage_of_total_spectra, fill=0)
+
+# Remove RUV samples 
+data_wide_noruv <- data_wide %>%
+  select(-c(RUV001A04, RUV001A07, RUV001A15, RUV001A16))
+
+# Remove proteins only found in RUV001 samples
+data_wide_noruv <- data_wide_noruv[rowSums(data_wide_noruv[2:21]) !=0, ]
+
+# Calculate average percentage
+data_wide_noruv$ave_perc <- rowMeans(data_wide_noruv[2:21])
+
+# Order by average percentage
+data_wide_noruv <- data_wide_noruv[order(-data_wide_noruv$ave_perc),]
+
+# Choose 20 most abundant protein clusters
+top20_noruv <- data_wide_noruv[1:20, ]
+```
+
+## Statistics
+
+Significant differences in abundance will be tested by doind a pairwise Wilcoxon rank sum test with Benjamini-Hochberg correction for each of the top 20 species.
+
+```{r}
+# Select only species column and average percentage 
+top20 <- top20_noruv %>%
+  select(c(protein_cluster, ave_perc))
+
+# Subset data for only top 20 species
+top20_data <- left_join(top20, data_wide)
+
+# Change data into long format and remove average
+top20_data_long <- top20_data %>%
+  gather(SampleID, percentage_spectra, 3:26) 
+
+# Add metadata
+top20_long_meta <- left_join(top20_data_long, UP_metadata_prot)
+
+# Fix protein cluster ID's
+top20_long_meta <- top20_long_meta %>%
+  mutate(protein_cluster = gsub("Cluster of ", "", protein_cluster)) %>%
+  separate(protein_cluster, c("protein_cluster", "remove"), "GN") %>%
+  select(-c(remove)) %>%
+  separate(protein_cluster, c("protein_cluster", "taxa"), "OS=")
+
+# Save for faster plotting in the future
+write.table(top20_long_meta,  "<PATH_TO_FILE>",  row.names = FALSE)
+
+# Remove RUV001
+top20_long_meta_noruv <- top20_long_meta %>%
+  filter(!Individual=="RUV001")
+
+# Apply statistical test to each protein cluster 
+
+### NOTE: This is still done one protein cluster at a time, I need to ask someone R-proficient how to make it into a loop ###
+
+pc <- top20_long_meta_noruv %>%
+  filter(protein_cluster=="<PROTEIN>")
+pc_test <- tidy(pairwise.wilcox.test(pc$percentage_spectra, pc$Category, p.adjust.method = "BH"))
+
+# Add sample to list of all protein clusters
+pc_test$protein_cluster <- "<PROTEIN>"
+pc_results <- rbind(pc_test, pc_results)
+
+pc_results <- pc_test #Only needs to be done first time 
+
+# Save results
+write.table(pc_results, " "<PATH_TO_FILE>"")
+
+### NOTE: You will need to adjust for each protein comparison too, since they are not independent. ###
+
+# Extract significant results
+sign_top20 <- pc_results %>%
+  filter(p.value < 0.05)
+
+# BH correction for 20 dependent proteins 
+p.adjust(sign_top20$p.value, method = "BH", n = 20)
+```
+
+## Plotting
+
+Data will be presented as a heatmap of protein cluster abundances across all samples.
+
+```{r}
+# Read in data
+top20_long_meta <- read.table("<PATH_TO_FILE>", header = TRUE)
+
+# Set order of categories 
+top20_long_meta$Category <- factor(top20_long_meta$Category, levels=c("PO10", "UP10", "PO2", "UP2"))
+
+# Re-order individuals from oldest to youngest
+top20_long_meta$Individual <- factor(top20_long_meta$Individual, 
+  levels=c("DRT001", "SMD017", "SMD046", "SMD051", "WIG001", "RUV001"))
+```
+
+Create plot:
+
+```{r}
+top20plot <- ggplot(top20_long_meta, 
+      aes(x=Category, y=reorder(protein_cluster, percentage_spectra), fill = percentage_spectra)) + 
+  geom_tile() + 
+  coord_equal() +
+  scale_fill_gradient(low = "white", high = "#332288", 
+                      name="Percentage of total spectra") +
+  theme_minimal(base_size = 10) + 
+  theme(axis.text.x = element_text(angle = 90, hjust=0.95, vjust=0.2)) +
+  theme(axis.text=element_text(size=7)) +
+  ylab("") +
+  facet_grid(~ Individual) 
+```
+Proteins will be coloured by origin (human/bacterial/eukaryotic) manually.
+
+
+# Principal component analysis
+
+## Preparation
+
+The input data is a "cluster report" exported from Scaffold, filtered for 5% protein FDR  and 1% peptide FDR.
+
+```{r import, warning=FALSE}
+# Import data
+raw_data <- read.delim("<PATH_TO_FILE>") %>%
+  janitor::clean_names() 
+
+# Import metadata
+UP_metadata_prot <- read.delim("<PATH_TO_FILE>")
+```
+
+## Data preparation
+
+```{r cleanup, results='hide', message=FALSE, warning=FALSE}
+# Remove any decoy hits
+data <- raw_data %>%
+  filter(!str_detect(protein_accession_numbers, 'rr\\|REV')) 
+
+# Remove collagens and keratins
+data <- data %>%
+  filter(!str_detect(protein_cluster, "Collagen|Keratin|Serum albumin"))
+
+# Remove unnecessary parts from sample name
+data <- data %>%
+  separate(ms_ms_sample_name, c("SampleID", "remove"), "_") %>%
+  dplyr::select(-c(remove))
+```
+
+## Filtering 
+
+For the PCA we will filter for presence of the cluster in at least two samples, to remove spurious (possibly false) hits, and use percentage of total spectra directly as quatitative value. Pseudocount zero replacement is done, and the data is then log2-transformed. This is following Jersie-christensen 2018 with some modifications. Two different PCA's are done, one with and one without RUV001.
+
+### Prepare data
+```{r norm4, results='hide', message=FALSE, warning=FALSE}
+# Select only the columns we need for further analysis
+data_pca <- data %>% 
+  dplyr::select(c("SampleID", "protein_cluster",
+                  "percentage_of_total_spectra"))
+
+# Remove percentage sign
+data_pca$percentage_of_total_spectra <- as.numeric(gsub("%", "",
+                            data_pca$percentage_of_total_spectra))
+
+# Transform data to wide format
+data_pca_wide <- spread(data_pca, SampleID, 
+                        percentage_of_total_spectra, fill = NA)
+
+# Fix protein cluster names
+data_pca_wide <- data_pca_wide %>%
+  mutate(protein_cluster = gsub("Cluster of ", "", protein_cluster)) %>%
+  separate(protein_cluster, c("protein_cluster", "remove"), "GN") %>%
+  dplyr::select(-c(remove))
+
+# Create dataset without RUV001, remove protein that were only present in RUV001
+data_pca_wide_noruv <- data_pca_wide %>%
+  dplyr::select(-starts_with("RUV"))
+data_pca_wide_noruv <- data_pca_wide_noruv[rowSums(is.na(data_pca_wide_noruv[2:21]))!=20,]
+
+# Only keep proteins present in at least two samples
+data_pca_wide <- data_pca_wide[rowSums(is.na(data_pca_wide[2:25]))<=22,]
+data_pca_wide_noruv <- data_pca_wide_noruv[rowSums(is.na
+                                  (data_pca_wide_noruv[2:21]))<=18,]
+
+# Change NA values into 0
+data_pca_wide[is.na(data_pca_wide)] <- 0
+data_pca_wide_noruv[is.na(data_pca_wide_noruv)] <- 0
+
+# Pseudocount zero replacement to make log-transformation possible
+data_pca_wide[,2:ncol(data_pca_wide)] <-
+  data_pca_wide[,2:ncol(data_pca_wide)]+1
+data_pca_wide_noruv[,2:ncol(data_pca_wide_noruv)] <- 
+  data_pca_wide_noruv[,2:ncol(data_pca_wide_noruv)]+1
+
+# log-transform spectral values
+data_pca_wide[, 2:25] <- log2(data_pca_wide[2:25])
+data_pca_wide_noruv[, 2:21] <- log2(data_pca_wide_noruv[2:21])
+```
+
+A total of 102 protein clusters survive filtering both with and without RUV001. 
+
+## PCA
+```{r PCA4, results='hide', message=FALSE, warning=FALSE}
+# Transpose dataframe
+data_pca_wide_tr <- data_pca_wide %>% 
+  gather(SampleID, value, 2:ncol(.)) %>%
+  spread(protein_cluster, value)
+data_pca_wide_tr_noruv <- data_pca_wide_noruv %>% 
+  gather(SampleID, value, 2:ncol(.)) %>%
+  spread(protein_cluster, value) 
+
+# Create PCA object
+pca.all <- prcomp(data_pca_wide_tr[, 2:102], scale=FALSE)
+pca.noruv <- prcomp(data_pca_wide_tr_noruv[, 2:102], scale=FALSE)
+```
+
+## Plotting
+
+Collect values from PCA objects.
+```{r}
+# Extract values
+pca_all_out <- as_tibble(pca.all$x)
+pca_all_out$SampleID <- data_pca_wide_tr$SampleID
+
+pca_noruv_out <- as_tibble(pca.noruv$x)
+pca_noruv_out$SampleID <- data_pca_wide_tr_noruv$SampleID
+
+# Add metadata 
+pca_all_meta <- left_join(UP_metadata_prot, pca_all_out)
+pca_noruv_meta <- left_join(pca_noruv_out, UP_metadata_prot)
+```
+
+To see what is driving the variation in the samples, we can take a closer look at the loadings of the PCA object.
+
+```{r}
+# Get variables with biggest impact for PC1 and PC2
+pca.all$rotation[,1] %>% sort() %>% head(2)
+pca.all$rotation[,1] %>% sort(decreasing = TRUE) %>% head(2)
+pca.all$rotation[,2] %>% sort() %>% head(2)
+pca.all$rotation[,2] %>% sort(decreasing = TRUE) %>% head(2)
+
+# And same for PCA without RUV001
+pca.noruv$rotation[,1] %>% sort() %>% head(2)
+pca.noruv$rotation[,1] %>% sort(decreasing = TRUE) %>% head(2)
+pca.noruv$rotation[,2] %>% sort() %>% head(2)
+pca.noruv$rotation[,2] %>% sort(decreasing = TRUE) %>% head(2)
+
+# Get rownames separately for each protein
+which(rownames(pca.noruv$rotation) %in% c("<PROTEIN>", "<PROTEIN>"))
+
+# Create matrix of x (PC1) coordinates and y (PC2) (duplicates removed)
+l.x <- cbind(pca.all$rotation[,1][c(17, 55, 45, 67, 48, 92,78)]) #17 twice
+l.y <- cbind(pca.all$rotation[,2][c(17, 55, 45, 67, 48, 92, 78)]) #17 twice
+
+# Create matrix of coordinates without RUV001 (duplicates removed)
+l.x.2 <- cbind(pca.noruv$rotation[,1][c(17, 59, 45, 67, 48, 57, 78)]) #17 twice
+l.y.2 <- cbind(pca.noruv$rotation[,2][c(17, 59, 45, 67, 48, 57, 78)]) #17 twice
+```
+
+Set aesthetics.
+```{r}
+# Calculate percent explained per PC
+percentage_all <- round(pca.all$sdev / sum(pca.all$sdev) * 100, 2)
+percentage_all <- paste(colnames(pca_all_out), "(", paste(
+  as.character(percentage_all), "%", ")", sep="") )
+
+percentage_noruv <- round(pca.noruv$sdev / sum(pca.noruv$sdev) * 100, 2)
+percentage_noruv <- paste(colnames(pca_noruv_out), "(", paste(
+  as.character(percentage_noruv), "%", ")", sep="") )
+
+# Set colours for individuals
+my_colors = c("#999933", "#888888", "#6699CC", "#332288", "#44AA99", "#AA4499")
+names(my_colors) = pca_all_meta$Individual %>% unique %>% sort
+
+# Set shapes for categories
+my_shapes = c(19, 1, 17, 2)
+names(my_shapes) = pca_all_meta$Category %>% unique %>% sort
+```
+
+And finally create plots!
+```{r}
+pca_all <- ggplot(data = pca_all_meta, 
+       aes(x = PC1, y = PC2, colour=Individual, shape=Category)) +
+  geom_point(size=4, stroke=3) +
+  scale_shape_manual(values=my_shapes) +
+  scale_color_manual(values=my_colors) +
+  xlab(percentage_all[1]) + 
+  ylab(percentage_all[2]) +
+  guides(fill=guide_legend(override.aes=list(shape=21, size=5))) +
+  theme_minimal(base_size = 12) +
+  annotate("segment", x=0, xend=l.x, y=0, yend=l.y, colour="black", 
+           size=1, arrow=arrow()) + 
+  annotate("text", x=l.x, y=l.y, label=rownames(l.x), color="red")
+
+pca_noruv <- ggplot(data = pca_noruv_meta, 
+       aes(x = PC1, y = PC2, colour=Individual, shape=Category)) +
+  geom_point(size=4, stroke=3) +
+  scale_shape_manual(values=my_shapes) +
+  scale_color_manual(values=my_colors) +
+  xlab(percentage_noruv[1]) + 
+  ylab(percentage_noruv[2]) +
+  guides(fill=guide_legend(override.aes=list(shape=21, size=5))) +
+  theme_minimal(base_size = 10) +
+  annotate("segment", x=0, xend=l.x.2, y=0, yend=l.y.2, colour="black", 
+           size=1, arrow=arrow()) + 
+  annotate("text", x=l.x.2, y=l.y.2, label=rownames(l.x.2), color="firebrick")
+```
+
+## PERMANOVA
+
+In order to see if the groupings are significantly different from each other, we will perform a PERMANOVA using the R package 'vegan'. Input data is sequence counts normalized in the same way as in the PCA above.
+
+```{r}
+# Remove RUV001 from metadata file
+meta_noruv <- UP_metadata_prot %>%
+  filter(!Individual=="RUV001")
+```
+
+And then we run the test.
+```{r}
+# Basic permanova with euclidean distance as metric
+permanova <- adonis(data_pca_wide_tr_noruv[, 2:103] ~ Individual + Weight + Protocol, 
+                    data=meta_noruv,
+                    permutations=999,
+                    method="euclidean")
+permanova
+```
+
+We also need to check that the variance homogeneity assumptions hold.
+
+```{r}
+dist <- vegdist(data_pca_wide_tr_noruv[, 2:103])
+anova(betadisper(dist, meta_noruv$Protocol))
+```
+
+Looks good!
+
+# Combine plots
+
+These three plots will be in the same figure in the paper. The PCA with RUV001 will be placed in the supplement.
+
+```{r}
+fig8 <- plot_grid(clusterplot, 
+                  plot_grid(top20plot, pca_noruv, labels = c('B', 'C'), 
+                            label_size = 12, ncol = 2),
+                  labels = c('A', ''), label_size = 16, nrow = 2)
+```
+

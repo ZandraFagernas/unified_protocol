@@ -1,0 +1,153 @@
+---
+title: "DNA characteristics"
+output: html_notebook
+author: "Zandra Fagernas"
+---
+
+This notebook explores fragment characteristics in samples for the paper "A unified protocol for simultaneous extraction of DNA and proteins from archaeological dental calculus" (Fagernaes et al. 2020). The data is summarized in figure 3. 
+
+For calculations of fragment characteristics, the raw reads were aligned to *Actinomyces oris* strain T14V (assembly ASM155393v1) and *Leptotrichia buccalis* strain DSM 1135 (assembly ASM2390v1) with EAGER (see details in methods section of paper). The bacterial genomes were chosen due to their high abundance in the samples, and their wide span in median GC-content. 
+
+```{r}
+library(janitor)
+library(ggpubr)
+library(tidyverse)
+```
+
+## Import data
+
+The EAGER output reports from each genome are used as input data.
+
+```{r}
+# A.oris
+eager_actori <- read.csv("<PATH_TO_FILE>") %>%
+  janitor::clean_names() %>%
+  select(sample_name, average_fragment_length, 
+         median_fragment_length, gc_content_in, mapped_reads_after_rm_dup)
+
+# L. buccalis
+eager_lepbuc <- read.csv("<PATH_TO_FILE>") %>%
+  janitor::clean_names() %>%
+  select(sample_name, average_fragment_length, 
+         median_fragment_length, gc_content_in, mapped_reads_after_rm_dup)
+
+# Metadata
+metadata <- read.delim("<PATH_TO_FILE>")
+```
+
+Add metadata:
+
+```{r}
+actori_meta <- left_join(eager_actori, metadata,
+                        by=c("sample_name"="LibraryID"))
+
+lepbuc_meta <- left_join(eager_lepbuc, metadata,
+                        by=c("sample_name"="LibraryID"))
+```
+
+## Statistics
+
+Significances of changes in mean fragment length between the protocols/starting weights are calculated with pairwise Wilcoxon tests, and corrected with the Benjamini-Hochberg method for multiple testing. Individual RUV001 in not included in any statistics, as stated in the paper.
+
+### Actinomyces oris
+
+```{r}
+# Remove RUV001
+actori_meta_noruv <- actori_meta %>%
+  filter(!Individual=="RUV001")
+
+# Median fragment length
+length_test <- pairwise.wilcox.test(actori_meta_noruv$median_fragment_length, actori_meta_noruv$Category, p.adjust.method = "BH")
+length_test 
+
+# GC-content
+gc_test <- pairwise.wilcox.test(actori_meta_noruv$gc_content_in, actori_meta_noruv$Category, p.adjust.method = "BH")
+gc_test 
+
+# Get number of fragments
+mean(actori_meta_noruv$mapped_reads_after_rm_dup)
+sd(actori_meta_noruv$mapped_reads_after_rm_dup)
+```
+
+### Dot plot
+
+Prepare aesthetics
+
+```{r}
+# Set colours for individuals
+my_colors = c("#DDCC77", "#888888", "#6699CC", "#332288", "#44AA99", "#AA4499")
+names(my_colors) = actori_meta$Individual %>% unique %>% sort
+
+# Set shapes for categories
+my_shapes = c(19, 1, 17, 2)
+names(my_shapes) = actori_meta$Category %>% unique %>% sort
+```
+
+And plot! 
+
+```{r}
+a <- ggplot(actori_meta, aes(x=gc_content_in, y=median_fragment_length,
+                       colour=Individual, shape=Category)) + 
+  geom_point(size=3, stroke=2) +
+  geom_vline(xintercept = 68.3, linetype="dashed", color = "darkgrey", size=1.5) +
+  scale_y_continuous(limits = c(35, 75)) +
+  scale_x_continuous(limits = c(65.5, 70.5)) +
+  ylab("Median fragment length") +
+  xlab("GC content (%)") +
+  ggtitle("Actinomyces oris") +
+  scale_shape_manual(values=my_shapes) +
+  scale_color_manual(values=my_colors) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "italic", hjust = 0.5)) 
+```
+
+### Leptotrichia buccalis
+
+```{r}
+# Remove RUV001
+lepbuc_meta_noruv <- lepbuc_meta %>%
+  filter(!Individual=="RUV001")
+
+# Median fragment length
+length_test <- pairwise.wilcox.test(lepbuc_meta_noruv$median_fragment_length, lepbuc_meta_noruv$Category, p.adjust.method = "BH")
+length_test 
+
+# GC-content
+gc_test <- pairwise.wilcox.test(lepbuc_meta_noruv$gc_content_in, lepbuc_meta_noruv$Category, p.adjust.method = "BH")
+gc_test 
+
+# Get number of fragments
+mean(lepbuc_meta_noruv$mapped_reads_after_rm_dup)
+sd(lepbuc_meta_noruv$mapped_reads_after_rm_dup)
+```
+
+### Dot plot
+
+```{r}
+l <- ggplot(lepbuc_meta, aes(x=gc_content_in, y=median_fragment_length,
+                       colour=Individual, shape=Category)) + 
+  geom_point(size=3, stroke=2) +
+  geom_vline(xintercept = 29.6, linetype="dashed", color = "darkgrey", size=1.5) +
+  scale_y_continuous(limits = c(35, 75)) +
+  scale_x_continuous(limits = c(29.5, 34.5)) +
+  ylab("Median fragment length") +
+  xlab("GC content (%)") +
+  ggtitle("Leptotrichia buccalis") +
+  scale_shape_manual(values=my_shapes) +
+  scale_color_manual(values=my_colors) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "italic", hjust = 0.5)) 
+```
+
+## Final plot
+
+Combine the two plots into one figure.
+
+```{r}
+gc_length_fig <- ggarrange(l, a, 
+                           ncol=1, nrow=2, 
+                           labels = c( "(A)", "(B)"),
+                           vjust = 1,
+                           common.legend = TRUE, 
+                           legend = "right")
+```
